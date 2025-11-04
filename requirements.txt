@@ -1,0 +1,6 @@
+pip
+-e .
+numpy==2.0.2
+pytest==7.4.0
+evt @ git+https://github.com/dcg3-illinois/evt-python.git@main
+networkx==3.1

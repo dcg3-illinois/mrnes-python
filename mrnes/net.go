@@ -9,16 +9,17 @@ package mrnes
 // including the background flows)
 import (
 	"fmt"
-	"github.com/iti/evt/evtm"
-	"github.com/iti/evt/vrtime"
-	"github.com/iti/rngstream"
-	"golang.org/x/exp/slices"
-	"gopkg.in/yaml.v3"
 	"math"
 	_ "os"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/iti/evt/evtm"
+	"github.com/iti/evt/vrtime"
+	"github.com/iti/rngstream"
+	"golang.org/x/exp/slices"
+	"gopkg.in/yaml.v3"
 )
 
 // The mrnsbit network simulator is built around two strong assumptions that
@@ -158,7 +159,7 @@ func (iqs *intrfcQStruct) addNetworkMsg(evtMgr *evtm.EventManager, nm *NetworkMs
 
 		nxtMsg := iqs.msgQueue[0].nm
 		serviceTime := computeServiceTime(nxtMsg.MsgLen, intrfc.State.Bndwdth)
-		advanced, qDelay := iqs.strmQ.queueingDelay(evtMgr.CurrentSeconds(), nxtMsg.intrfcArr, 
+		advanced, qDelay := iqs.strmQ.queueingDelay(evtMgr.CurrentSeconds(), nxtMsg.intrfcArr,
 			serviceTime, nxtMsg.prevIntrfcID)
 
 		msrArrivals = false
@@ -1510,16 +1511,16 @@ type switchDev struct {
 
 // The switchState struct holds auxiliary information about the switch
 type switchState struct {
-	Rngstrm    *rngstream.RngStream // pointer to a random number generator
-	Trace      bool                 // switch for calling trace saving
-	Drop       bool                 // switch to allow dropping packets
-	Active     map[int]float64
-	Load       float64
-	BufferSize float64
-	Capacity   float64
-	Forward    DFS
-	Packets    int
-	DefaultOp  map[string]string
+	Rngstrm      *rngstream.RngStream // pointer to a random number generator
+	Trace        bool                 // switch for calling trace saving
+	Drop         bool                 // switch to allow dropping packets
+	Active       map[int]float64
+	Load         float64
+	BufferSize   float64
+	Capacity     float64
+	Forward      DFS
+	Packets      int
+	DefaultOp    map[string]string
 	DevExecOpTbl map[string]OpMethod
 }
 
@@ -1579,7 +1580,6 @@ func (swtch *switchDev) AddDevExecOp(op string, opFunc OpMethod) {
 func (swtch *switchDev) SetDefaultOp(src, op string) {
 	swtch.SwitchState.DefaultOp[src] = op
 }
-
 
 // matchParam is used to determine whether a run-time parameter description
 // should be applied to the switch. Its definition here helps switchDev satisfy
@@ -1686,7 +1686,7 @@ func (swtch *switchDev) DevDelay(msg *NetworkMsg) float64 {
 
 			// see if the function is actually the empty one, meaning its not there
 			if opFunc == nil {
-				panic(fmt.Errorf("in switch %s dev op %s lacking user-provided instantiation", 
+				panic(fmt.Errorf("in switch %s dev op %s lacking user-provided instantiation",
 					swtch.SwitchName, metaKey))
 			}
 			return opFunc(swtch, metaKey, msg)
@@ -1700,7 +1700,7 @@ func (swtch *switchDev) DevDelay(msg *NetworkMsg) float64 {
 	if present {
 		opFunc := swtch.SwitchState.DevExecOpTbl[defaultOp]
 		if opFunc == nil {
-			panic(fmt.Errorf("in switch %s dev op %s lacking user-provided instantiation", 
+			panic(fmt.Errorf("in switch %s dev op %s lacking user-provided instantiation",
 				swtch.SwitchName, defaultOp))
 		}
 		return opFunc(swtch, defaultOp, msg)
@@ -1729,14 +1729,14 @@ type routerDev struct {
 
 // The routerState type describes auxiliary information about the router
 type routerState struct {
-	Rngstrm *rngstream.RngStream // pointer to a random number generator
-	Trace   bool                 // switch for calling trace saving
-	Drop    bool                 // switch to allow dropping packets
-	Active  map[int]float64
-	Load    float64
-	Buffer  float64
-	Forward map[int]intrfcIDPair
-	Packets int
+	Rngstrm      *rngstream.RngStream // pointer to a random number generator
+	Trace        bool                 // switch for calling trace saving
+	Drop         bool                 // switch to allow dropping packets
+	Active       map[int]float64
+	Load         float64
+	Buffer       float64
+	Forward      map[int]intrfcIDPair
+	Packets      int
 	DefaultOp    map[string]string
 	DevExecOpTbl map[string]OpMethod
 }
@@ -1960,7 +1960,7 @@ type NetworkMsg struct {
 	MsgLen         int            // length of the entire message, in bytes
 	PcktIdx        int            // index of packet with msg
 	NumPckts       int            // number of packets in the message this is part of
-	MetaData	   map[string]any // carrier of extra stuff
+	MetaData       map[string]any // carrier of extra stuff
 	Msg            any            // message being carried.
 	intrfcArr      float64
 	StrmPckt       bool
@@ -2484,4 +2484,3 @@ func prevDeviceName(msg *NetworkMsg) string {
 	srcIntrfc := IntrfcByID[rtStep.srcIntrfcID]
 	return srcIntrfc.Device.DevName()
 }
-
