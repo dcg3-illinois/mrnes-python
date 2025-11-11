@@ -45,13 +45,6 @@ class DevExecList:
         # of descriptions of the timing of that operation, as a function of device model
         self.Times: Dict[str, List[DevExecDesc]] = {}
 
-    # CreateDevExecList is an initialization constructor.
-    # Its output struct has methods for integrating data.
-    @staticmethod
-    def CreateDevExecList(listname: str) -> 'DevExecList':
-        delist = DevExecList(listname)
-        return delist
-
     # WriteToFile stores the DevExecList struct to the file whose name is given.
     # Serialization to json or to yaml is selected based on the extension of this name.
     def WriteToFile(self, filename: str) -> Optional[Exception]:
@@ -77,32 +70,38 @@ class DevExecList:
             raise e
         return None
 
-    # ReadDevExecList deserializes a byte slice holding a representation of an DevExecList struct.
-    # If the input argument of dict (those bytes) is empty, the file whose name is given is read
-    # to acquire them.  A deserialized representation is returned, or an error if one is generated
-    # from a file read or the deserialization.
-    @staticmethod
-    def ReadDevExecList(filename: str, useYAML: bool, dict_bytes: bytes) -> Optional['DevExecList']:
-        if not dict_bytes:
-            with open(filename, "rb") as f:
-                dict_bytes = f.read()
-        
-        if useYAML:
-            data = yaml.safe_load(dict_bytes)
-        else:
-            data = json.loads(dict_bytes)
-
-        delist = DevExecList(data.get('ListName', ''))
-        times = data.get('Times', {})
-        for op, descs in times.items():
-            delist.Times[op] = [DevExecDesc(**desc) for desc in descs]
-        return delist
-
     # AddTiming takes the parameters of a DevExecDesc, creates one, and adds it to the FuncExecList
     def AddTiming(self, devOp: str, model: str, execTime: float, pcktlen: int, bndwdth: float):
         if devOp not in self.Times:
             self.Times[devOp] = []
         self.Times[devOp].append(DevExecDesc(devOp, model, pcktlen, execTime, bndwdth))
+
+# CreateDevExecList is an initialization constructor.
+# Its output struct has methods for integrating data.
+def CreateDevExecList(listname: str) -> 'DevExecList':
+    delist = DevExecList(listname)
+    return delist
+
+
+# ReadDevExecList deserializes a byte slice holding a representation of an DevExecList struct.
+# If the input argument of dict (those bytes) is empty, the file whose name is given is read
+# to acquire them.  A deserialized representation is returned, or an error if one is generated
+# from a file read or the deserialization.
+def ReadDevExecList(filename: str, useYAML: bool, dict_bytes: bytes) -> Optional['DevExecList']:
+    if not dict_bytes:
+        with open(filename, "rb") as f:
+            dict_bytes = f.read()
+    
+    if useYAML:
+        data = yaml.safe_load(dict_bytes)
+    else:
+        data = json.loads(dict_bytes)
+
+    delist = DevExecList(data.get('ListName', ''))
+    times = data.get('Times', {})
+    for op, descs in times.items():
+        delist.Times[op] = [DevExecDesc(**desc) for desc in descs]
+    return delist
 
 # numberOfIntrfcs (and more generally, numberOf{Objects}
 # are counters of the number of default instances of each

@@ -10,6 +10,11 @@ import math
 from evt_python.evt import evtm
 import evt_python.evt.vrtime as vrtime
 import mrnes.trace as trace
+import mrnes
+import net
+import routes
+import flow_sim
+import transition
 
 # The mrnsbit network simulator is built around two strong assumptions that
 # simplify implementation, but which may have to be addressed if mrnsbit
@@ -334,6 +339,694 @@ class NetworkPortal:
 			self.LossRtn[connectID] = rtnRec
 		
 		return connectID
+	
+	###################### BEGIN TRANSITION.PY METHODS #########################
+
+	# EnterNetwork is called after the execution from the application layer
+	# It creates NetworkMsg structs to represent the start and end of the message, and
+	# schedules their arrival to the egress interface of the message source endpt
+	#
+	# Two kinds of traffic may enter the network, Flow and Discrete
+	# Entries for a flow may establish a new one, modify an existing one, or delete existing ones.
+	# Messages that notify destinations of these actions may be delivered instantly, may be delivered using
+	# an estimate of the cross-network latency which depends on queueing network approximations, or may be
+	# pushed through the network as individual packets, simulated at each network device.
+	#
+	# input connType is one of {Flow, Discrete}
+	# flowAction is one of {Srt, End, Chg}
+	# connLatency is one of {Zero, Place, Simulate}
+	#
+	# We approximate the time required for a packet to pass through an interface or network is a transition constant plus
+	# the mean time in an M/D/1 queuing system.  The arrivals are packets whose length is the frame size,
+	# the deterministic service time D is time required to serve a packet with a server whose bit service rate
+	# is the bandwidth available at the interface or network to serve (meaning the total capacity minus the
+	# bandwidth allocations to other flows at that interface or network), and the arrival rate is the accepted
+	# rate allocated to the flow.
+	# Description of possible input parameters
+	#
+	# | Message		 | connType	  | flowAction	| connLatency		   | flowID
+	# | --------------- | ------------- | ------------- | --------------------- | ----------------------- |
+	# | Discrete Packet | DiscreteConn  | N/A		   | Zero, Place, Simulate | >0 => embedded		  |
+	# | Flow			| FlowConn	  | Srt, Chg, End | Zero, Place, Simulate | flowID>0				|
+	def enter_network(self, evt_mgr, src_dev, dst_dev, msg_len, conn_desc, IDs, rtns, request_rate, msr_id, strm_pckt, strm_pckt_id, msg) -> tuple[int, float, bool]:
+		# pull out the IDs for clarity
+		flow_id = IDs.FlowID
+		connect_id = IDs.ConnectID
+		exec_id = IDs.ExecID
+
+		# if connectID>0 make sure that an entry in np.Connections exists
+		present = connect_id in self.Connections
+		if connect_id > 0 and not present:
+			raise Exception("non-zero connectID offered to EnterNetwork w/o corresponding Connections entry")
+		
+		# is the message about a discrete packet, or a flow?
+		is_pckt = (conn_desc.Type == transition.ConnType.DiscreteConn)
+		
+		# if flowID >0 and flowAction != Srt, make sure that various np data structures that use it for indexing exist
+		if not is_pckt and conn_desc.Action != net.FlowAction.Srt:
+			present0 = flow_id in self.RequestRate
+			present1 = flow_id in self.AcceptedRate
+			if not (present0 and present1):
+				raise Exception("flowID>0 presented to EnterNetwork without supporting data structures")
+		
+		# find the route, which needs the endpoint IDs
+		src_id = mrnes.TopoDevByName[src_dev].DevID()
+		dst_id = mrnes.TopoDevByName[dst_dev].DevID()
+		route = routes.find_route(src_id, dst_id)
+
+		# make sure we have a route to use
+		if route is None or len(route) == 0:
+			raise Exception(f"unable to find a route {src_dev} -> {dst_dev}")
+		
+		# take the frame size to be the minimum of the message length
+		# and the minimum MTU on interfaces between source and destination
+		frame_size = net.FindFrameSize(flow_id, route)
+		if is_pckt and msg_len < frame_size:
+			frame_size = msg_len
+		
+		# number of frames for a discrete connection may depend on the message length,
+		# all other connections have just one frame reporting the change
+		num_frames = 1
+		if conn_desc.Type == transition.ConnType.DiscreteConn:
+			num_frames = msg_len // frame_size
+			if msg_len % frame_size > 0:
+				num_frames += 1
+		
+		# A packet entry has flowID == 0
+		if not is_pckt:
+			self.RequestRate[flow_id] = request_rate
+		
+		if not (connect_id > 0):
+			# tell the portal about the arrival, passing to it a description of the
+			# response to be made, and the number of frames of the same message that
+			# need to be received before reporting completion
+			connect_id = self.arrive(rtns, num_frames)
+			
+			# remember the flowIDs, given the connectionID
+			if not is_pckt:
+				self.Connections[connect_id] = flow_id
+				self.InvConnection[flow_id] = connect_id
+			
+		# Flows and packets are handled differently
+		if conn_desc.Type == transition.ConnType.FlowConn:
+			accepted = self.flow_entry(evt_mgr, src_dev, dst_dev, msg_len, conn_desc, 
+				flow_id, connect_id, request_rate, route, msg)
+			if accepted:
+				return connect_id, self.AcceptedRate[flow_id], True
+			else:
+				return connect_id, 0.0, False
+		
+		# get the interface through which the message passes to get to the network.
+		# remember that a route step names the srcIntrfcID as the interface used to get into a network,
+		# and the dstIntrfcID as the interface used to ingress the next device
+		intrfc = mrnes.IntrfcByID[route[0].srcIntrfcID]
+
+		# ordinary packet entry; make a message wrapper and push the message at the entry
+		# of the endpt's egress interface.  Segment the message into frames and push them individually
+		delay = 0.0
+
+		for fm_number in range(num_frames):
+			nm = net.NetworkMsg()
+			nm.MsrID = msr_id
+			
+			if strm_pckt:
+				nm.MsgID = strm_pckt_id
+			else:
+				nm.MsgID = net.NetworkMsgID
+				net.NetworkMsgID += 1 # TODO: check to see if this is acutally changing this value
+			
+			nm.StepIdx = 0
+			nm.Route = route
+			nm.Rate = 0.0
+			nm.Syncd = []
+			nm.PcktRate = float('inf') / 4
+			nm.PrArrvl = 1.0
+			nm.StartTime = evt_mgr.CurrentSeconds()
+			nm.MsgLen = frame_size
+			nm.ConnectID = connect_id
+			nm.FlowID = flow_id
+			nm.ExecID = exec_id
+			nm.Connection = conn_desc
+			nm.PcktIdx = fm_number
+			nm.NumPckts = num_frames
+			nm.StrmPckt = strm_pckt
+			nm.Msg = msg
+
+			nm.MetaData = {}
+
+			# schedule the message's next destination
+			self.send_net_msg(evt_mgr, nm, delay)
+
+			# Now long to get through the device to the interface?
+			# The delay above should probably measure CPU bandwidth to deliver to the interface,
+			# but it is a small number and another parameter to have to deal with, so we just use interface bandwidth
+			delay += (frame_size * 8) / 1e6 / intrfc.State.Bndwdth
+			delay += intrfc.State.Delay
+			
+		return connect_id, request_rate, True
+
+	# FlowEntry handles the entry of flows to the network
+	def flow_entry(self, evt_mgr, src_dev, dst_dev, msg_len, conn_desc, flow_id, connect_id, request_rate, route, msg):
+		# set the network message and flow connection types
+		flow_action = conn_desc.Action
+		
+		# revise the requested rate for the major flow
+		self.RequestRate[flow_id] = request_rate
+		
+		# Setting up the Flow on Srt
+		if flow_action == net.FlowAction.Srt:
+			# include a new flow into the network infrastructure.
+			# return a structure whose entries are used to estimate latency when requested
+			self.LatencyConsts[flow_id] = transition.build_flow(flow_id, route)
+		
+		# change the flow rate for the flowID and take note of all
+		# the major flows that were recomputed
+		chg_flow_ids, established = self.establish_flow_rate(evt_mgr, flow_id, request_rate, route, flow_action)
+		
+		if not established:
+			return False
+		
+		# create the network message to be introduced into the network.
+		#
+		nm = net.NetworkMsg()
+		nm.Route = route
+		nm.Rate = self.AcceptedRate[flow_id]
+		nm.PcktRate = float('inf') / 4
+		nm.PrArrvl = 1.0
+		nm.MsgLen = msg_len
+		nm.Connection = conn_desc
+		nm.ConnectID = connect_id
+		nm.FlowID = flow_id
+		nm.Msg = msg
+		nm.NumPckts = 1
+		nm.StartTime = evt_mgr.CurrentSeconds()
+
+		# depending on the connLatency we post a message immediately,
+		# after an approximated delay, or through simulation
+		latency = self.compute_flow_latency(nm)
+		
+		self.send_net_msg(evt_mgr, nm, 0.0)
+		
+		# if this is End, remove the identified flow
+		if flow_action == net.FlowAction.End:
+			self.rm_flow(evt_mgr, flow_id, route, latency)
+		
+		# for each changed flow report back the change and the acception rate, if requested
+		for flw_id in chg_flow_ids:
+			# probably not needed but cheap protection against changes in EstablishFlowRate
+			if flw_id == flow_id:
+				continue
+			self.report_flow_chg(evt_mgr, flw_id, flow_action, latency)
+		return True
+
+	# ReportFlowChg visits the return record maps to see if the named flow
+	# asked to have changes reported, and if so does so as requested.  The reports
+	# are schedule to occur 'latency' time in the future, when the effect of
+	# the triggered action is recognized at the triggering flow's receiving end.
+	def report_flow_chg(self, evt_mgr, flow_id, action, latency):
+		accepted_rate = self.AcceptedRate[flow_id]
+		rfs = transition.RprtRate()
+		rfs.FlowID = flow_id
+		rfs.AcceptedRate = accepted_rate
+		rfs.Action = action
+		
+		# a request for reporting back to the source is indicated by the presence
+		# of an entry in the ReportRtnSrc map
+		rrec = self.ReportRtnSrc.get(flow_id)
+		if rrec:
+			# report the change to the source
+			if latency > 0.0:
+				evt_mgr.Schedule(rrec.rtnCxt, rfs, rrec.rtnFunc, vrtime.SecondsToTime(latency))
+			else:
+				rrec.rtnFunc(evt_mgr, rrec.rtnCxt, rfs)
+		
+		rrec = self.ReportRtnDst.get(flow_id)
+		if rrec:
+			# report the change to the destination
+			if latency > 0.0:
+				evt_mgr.Schedule(rrec.rtnCxt, rfs, rrec.rtnFunc, vrtime.SecondsToTime(latency))
+			else:
+				rrec.rtnFunc(evt_mgr, rrec.rtnCxt, rfs)
+	
+	# RmFlow de-establishes data structures in the interfaces and networks crossed
+	# by the given route, with a flow having the given flowID
+	def rm_flow(self, evt_mgr: evtm.EventManager, rmflow_id: int, route: List[net.intrfcsToDev], latency: float):
+		# clear the request rate in case of reference before this call completes
+		old_rate = self.RequestRate[rmflow_id]
+		self.RequestRate[rmflow_id] = 0.0
+		
+		# remove the flow from the data structures of the interfaces, devices, and networks
+		# along the route
+		for idx in range(len(route)):
+			rt_step = route[idx]
+			
+			# all steps have an egress side.
+			# get the interface
+			egress_intrfc = mrnes.IntrfcByID[rt_step.srcIntrfcID]
+			dev = egress_intrfc.Device
+			
+			# remove the flow from the interface
+			egress_intrfc.rm_flow(rmflow_id, old_rate, False)
+			
+			# adjust the network to the flow departure
+			nt = mrnes.NetworkByID[rt_step.netID]
+			ifcpr = net.intrfcIDPair(prevID=rt_step.srcIntrfcID, nextID=rt_step.dstIntrfcID)
+			nt.rm_flow(rmflow_id, ifcpr)
+
+			# the device got a Forward entry for this flowID only if the flow doesn't originate there
+			if idx > 0:
+				ingress_intrfc = mrnes.IntrfcByID[route[idx-1].dstIntrfcID]
+				ingress_intrfc.rm_flow(rmflow_id, old_rate, True)
+				
+				# remove the flow from the device's forward maps
+				if egress_intrfc.DevType == net.DevCode.RouterCode:
+					rtr = dev  # .as_router()
+					rtr.rm_forward(rmflow_id)
+				elif egress_intrfc.DevType == net.DevCode.SwitchCode:
+					swtch = dev  # .as_switch()
+					swtch.rm_forward(rmflow_id)
+
+		# report the change to src and dst if requested
+		self.report_flow_chg(evt_mgr, rmflow_id, net.FlowAction.End, latency)
+		
+		# clear up the maps with indices equal to the ID of the removed flow,
+		# and maps indexed by connectionID of the removed flow
+		self.clear_rm_flow(rmflow_id)
+
+	# EstablishFlowRate is given a major flow ID, request rate, and a route,
+	# and then first figures out what the accepted rate can be given the current state
+	# of all the major flows (by calling DiscoverFlowRate).   It follows up
+	# by calling SetFlowRate to establish that rate through the route for the named flow.
+	# Because of congestion, it may be that setting the rate may force recalculation of the
+	# rates for other major flows, and so SetFlowRate returns a map of flows to be
+	# revisited, and upper bounds on what their accept rates might be.  This leads to
+	# a recursive call to EstablishFlowRate
+	def establish_flow_rate(self, evt_mgr: evtm.EventManager, flow_id: int, request_rate: float, route: List[net.intrfcsToDev], action: net.FlowAction):
+		flow_ids = {}
+		
+		accept_rate, found = self.discover_flow_rate(flow_id, request_rate, route)
+		if not found:
+			return {}, False
+		
+		# set the rate, and get back a list of ids of major flows whose rates should be recomputed
+		changes = self.set_flow_rate(evt_mgr, flow_id, accept_rate, route, action)
+		
+		# we'll keep track of all the flows calculated (or recalculated)
+		flow_ids[flow_id] = True
+		
+		# revisit every flow whose converged rate might be affected by the rate setting in flow_id
+		for nxt_id, nxt_rate in changes.items():
+			if nxt_id == flow_id:
+				continue
+			more_ids, established = self.establish_flow_rate(evt_mgr, nxt_id, min(nxt_rate, self.RequestRate[nxt_id]), route, action)
+			
+			if not established:
+				return {}, False
+			
+			flow_ids[nxt_id] = True
+			for m_id in more_ids:
+				flow_ids[m_id] = True
+		
+		return flow_ids, True
+
+	# DiscoverFlowRate is called after the infrastructure for new
+	# flow with ID flowID is set up, to determine what its rate will be
+	def discover_flow_rate(self, flow_id: int, request_rate: float, route: List[net.intrfcsToDev]):
+		
+		min_rate = request_rate
+		
+		# is the requestRate a hard ask (inelastic) or best effort
+		is_elastic = self.Elastic[flow_id]
+
+		# visit each step on the route
+		for idx in range(len(route)):
+			
+			rt_step = route[idx]
+			
+			# flag indicating whether we need to analyze the ingress side of the route step.
+			# The egress side is always analyzed
+			do_ingress_side = (idx > 0)
+			
+			# ingress side first, then egress side
+			for side_idx in range(2):
+				ingress_side = (side_idx == 0)
+				# the analysis looks the same for the ingress and egress sides, so
+				# the same code block can be used for it.   Skip a side that is not
+				# consistent with the route step
+				if ingress_side and not do_ingress_side:
+					continue
+				
+				# set up intrfc and depending on which interface side we're analyzing
+				if ingress_side:
+					# router steps describe interface pairs across a network,
+					# so our ingress interface ID is the destination interface ID
+					# of the previous routing step
+					intrfc = mrnes.IntrfcByID[route[idx-1].dstIntrfcID]
+					intrfc_map = intrfc.State.ToIngress
+				else:
+					intrfc = mrnes.IntrfcByID[route[idx].srcIntrfcID]
+					intrfc_map = intrfc.State.ToEgress
+				
+				# usedBndwdth will accumulate the rates of all existing flows, plus the reservation
+				used_bndwdth = 0.0
+				
+				# fixedBndwdth will accumulate the rates of all inelastic flows, plus the resevation
+				fixed_bndwdth = 0.0
+				for flw_id, rate in intrfc_map.items():
+					used_bndwdth += rate
+					if not self.Elastic[flw_id]:
+						fixed_bndwdth += rate
+				
+				# freeBndwdth is what is freely available to any flow
+				free_bndwdth = intrfc.State.Bndwdth - used_bndwdth
+				
+				# useableBndwdth is what is available to an inelastic flow
+				useable_bndwdth = intrfc.State.Bndwdth - fixed_bndwdth
+				
+				# can a request for inelastic bandwidth be satisfied at all?
+				if not is_elastic and useable_bndwdth < request_rate:
+					# no
+					return 0.0, False
+				
+				# can the request on the ingress (non network) side be immediately satisfied?
+				if ingress_side and min_rate <= free_bndwdth:
+					# yes
+					continue
+				
+				# an inelastic flow can just grab what it wants (and we'll figure out the
+				# squeeze later). On the egress side we will need to look at the network.
+				#	For an elastic flow we may need to squeeze
+				if self.Elastic[flow_id]:
+					to_map = [flow_id]
+					
+					for flw_id in intrfc_map:
+						# avoid having flow_id in more than once
+						if flw_id == flow_id:
+							continue
+						
+						if self.Elastic[flw_id]:
+							to_map.append(flw_id)
+					
+					load_frac_vec = net.ActivePortal.requestedLoadFracVec(to_map)
+					
+					# elastic flow_id can get its share of the freely available bandwidth
+					min_rate = min(min_rate, load_frac_vec[0] * free_bndwdth)
+				
+				# when focused on the egress side consider the network faced by the interface
+				if not ingress_side:
+					nt = intrfc.Faces
+
+					# get a pointer to the interface on the other side of the network
+					nxt_intrfc = mrnes.IntrfcByID[rt_step.dstIntrfcID]
+					
+					# netUsedBndwdth accumulates the bandwidth of all unique flows that
+					# leave the egress side or enter the other interface's ingress side
+					net_used_bndwdth = 0.0
+					
+					# netFixedBndwdth accumulates the bandwidth of all unique flows that
+					# leave the egress side or enter the other interface's ingress side
+					net_fixed_bndwdth = 0.0
+					
+					# create a list of unique flows that leave the egress side or enter the ingress side
+					# and gather up the netUsedBndwdth and netFixedBndwdth rates
+					net_flows = {}
+					for flw_id, rate in intrfc_map.items():
+						if flw_id in net_flows:
+							continue
+						net_flows[flw_id] = True
+						net_used_bndwdth += rate
+						if not self.Elastic[flw_id]:
+							net_fixed_bndwdth += rate
+					
+					# incorporate the flows on the ingress side
+					for flw_id, rate in nxt_intrfc.State.ToIngress.items():
+						if flw_id in net_flows:
+							continue
+						
+						net_used_bndwdth += rate
+						if not self.Elastic[flw_id]:
+							net_fixed_bndwdth += rate
+					
+					# netFreeBndwdth is what is freely available to any flow
+					net_free_bndwdth = nt.NetState.Bndwdth - net_used_bndwdth
+					
+					# netUseableBndwdth is what is available to an inelastic flow
+					net_useable_bndwdth = nt.NetState.Bndwdth - net_fixed_bndwdth
+					
+					if net_free_bndwdth <= 0 or net_useable_bndwdth <= 0:
+						return 0.0, False
+					
+					# admit a flow if its request rate is less than the netUseableBndwdth
+					if request_rate <= net_useable_bndwdth:
+						continue
+					elif not is_elastic:
+						return 0.0, False
+					
+					# admit an elastic flow if all the elastic flows can be squeezed to let it in,
+					# but figure out what its squeezed value needs to be
+					to_map = [flow_id]
+					for flw_id in net_flows:
+						if flw_id == flow_id:
+							continue
+
+						if self.Elastic[flw_id]:
+							to_map.append(flw_id)
+					load_frac_vec = net.ActivePortal.requestedLoadFracVec(to_map)
+
+					# elastic flow_id can get its share of the freely available bandwidth
+					min_rate = min(min_rate, load_frac_vec[0] * net_free_bndwdth)
+		return min_rate, True
+	
+	# SetFlowRate sets the accept rate for major flow flowID all along its path,
+	# and notes the identities of major flows which need attention because this change
+	# may impact them or other flows they interact with
+	def set_flow_rate(self, evt_mgr, flow_id, accept_rate, route, action):
+		
+		# this is for keeps (for now...)
+		self.AcceptedRate[flow_id] = accept_rate
+
+		is_elastic = self.Elastic[flow_id]
+		
+		# remember the ID of the major flows whose accepted rates may change
+		changes = {}
+		
+		prev_dst_intrfc_id = None
+		dst_intrfc_id = None
+		prev_src_intrfc_id = None
+		
+		# visit each step on the route
+		for idx in range(len(route)):
+			# remember the step particulars
+			rt_step = route[idx]
+
+			prev_dst_intrfc_id = dst_intrfc_id
+			dst_intrfc_id = rt_step.dstIntrfcID
+
+			# ifcpr may be needed to index into a map later
+			ifcpr = net.intrfcIDPair(prevID=rt_step.srcIntrfcID, nextID=rt_step.dstIntrfcID)
+			
+			# flag indicating whether we need to analyze the ingress side of the route step.
+			# The egress side is always analyzed
+			do_ingress_side = (idx > 0)
+			
+			if idx == 0:
+				out_intrfc = mrnes.IntrfcByID[rt_step.srcIntrfcID]
+				out_intrfc.chg_flow_rate(0, flow_id, accept_rate, False)
+			
+			# ingress side first, then egress side
+			for side_idx in range(2):
+				ingress_side = (side_idx == 0)
+				# the analysis looks the same for the ingress and egress sides, so
+				# the same code block can be used for it.   Skip a side that is not
+				# consistent with the route step
+				if ingress_side and not do_ingress_side:
+					continue
+				
+				# set up intrfc and intrfcMap depending on which interface side we're analyzing
+				if ingress_side:
+					# router steps describe interface pairs across a network,
+					# so our ingress interface ID is the destination interface ID
+					# of the previous routing step
+					intrfc = mrnes.IntrfcByID[route[idx-1].dstIntrfcID]
+					prev_src_intrfc_id = route[idx-1].srcIntrfcID
+					intrfc_map = intrfc.State.ToIngress
+				else:
+					intrfc = mrnes.IntrfcByID[route[idx].srcIntrfcID]
+					intrfc_map = intrfc.State.ToEgress
+				
+				# if the accept rate hasn't changed coming into this interface,
+				# we can skip it
+				if abs(accept_rate - intrfc_map[flow_id]) < 1e-3:
+					continue
+				
+				fixed_bndwdth = 0.0
+				for flw_id, rate in intrfc_map.items():
+					if not self.Elastic[flw_id]:
+						fixed_bndwdth += rate
+				
+				# if the interface wasn't compressing elastic flows before
+				# or after the change, its peers aren't needing attention due to this interface
+				was_congested = intrfc.is_congested(ingress_side)
+				if ingress_side:
+					intrfc.chg_flow_rate(prev_src_intrfc_id, flow_id, accept_rate, ingress_side)
+				else:
+					intrfc.chg_flow_rate(prev_dst_intrfc_id, flow_id, accept_rate, ingress_side)
+				
+				is_congested = intrfc.is_congested(ingress_side)
+				
+				if was_congested or is_congested:
+					to_map = [flow_id] if is_elastic else []
+					
+					for flw_id in intrfc_map:
+						# avoid having flowID in more than once
+						if flw_id == flow_id:
+							continue
+						if self.Elastic[flw_id]:
+							to_map.append(flw_id)
+					
+					rsrvd_frac_vec = self.requestedLoadFracVec(to_map) if to_map else []
+					
+					for idx2, flw_id in enumerate(to_map):
+						if flw_id == flow_id:
+							continue
+
+						rsvd_rate = rsrvd_frac_vec[idx2] * (intrfc.State.Bndwdth - fixed_bndwdth)
+						
+						# remember the least bandwidth upper bound for major flow flw_id
+						chg_rate = changes.get(flw_id)
+						if chg_rate is not None:
+							chg_rate = min(chg_rate, rsvd_rate)
+							changes[flw_id] = chg_rate
+						else:
+							changes[flw_id] = rsvd_rate
+
+				# for the egress side consider the network
+				if not ingress_side:
+					network_obj = intrfc.Faces
+
+					dst_intrfc = mrnes.IntrfcByID[rt_step.dstIntrfcID]
+					network_obj.chg_flow_rate(flow_id, ifcpr, accept_rate)
+					
+					was_congested = network_obj.is_congested(intrfc, dst_intrfc)
+					
+					is_congested = network_obj.is_congested(intrfc, dst_intrfc)
+					
+					if was_congested or is_congested:
+						to_map = [flow_id] if is_elastic else []
+						
+						for flw_id in intrfc.State.ThruEgress:
+							if flw_id == flow_id:
+								continue
+							if self.Elastic[flw_id]:
+								to_map.append(flw_id)
+						
+						for flw_id in dst_intrfc.State.ToIngress:
+							if flw_id in to_map:
+								continue
+							if self.Elastic[flw_id]:
+								to_map.append(flw_id)
+						
+						rsrvd_frac_vec = self.requestedLoadFracVec(to_map) if to_map else []
+						
+						for idx2, flw_id in enumerate(to_map):
+							if flw_id == flow_id:
+								continue
+							
+							rsvd_rate = rsrvd_frac_vec[idx2] * network_obj.NetState.Bndwdth
+							chg_rate = changes.get(flw_id)
+							if chg_rate is not None:
+								chg_rate = min(chg_rate, rsvd_rate)
+								changes[flw_id] = chg_rate
+							else:
+								changes[flw_id] = rsvd_rate
+		return changes
+
+	# SendNetMsg moves a NetworkMsg, depending on the latency model.
+	# If 'Zero' the message goes to the destination instantly, with zero network latency modeled
+	# If 'Place' the message is placed at the destionation after computing a delay timing through the network
+	# If 'Simulate' the message is placed at the egress port of the sending device and the message is simulated
+	# going through the network to its destination
+	def send_net_msg(self, evt_mgr, nm, offset):
+		
+		# remember the latency model, and the route
+		conn_latency = nm.Connection.Latency
+		route = nm.Route
+		
+		if conn_latency == transition.ConnLatency.Zero:
+			# the message's position in the route list---the last step
+			nm.StepIdx = len(route) - 1
+			self.send_immediate(evt_mgr, nm)
+		elif conn_latency == transition.ConnLatency.Place:
+			# the message's position in the route list---the last step
+			nm.StepIdx = len(route) - 1
+			self.place_net_msg(evt_mgr, nm, offset)
+		elif conn_latency == transition.ConnLatency.Simulate:
+			# get the interface at the first step
+			intrfc = mrnes.IntrfcByID[route[0].srcIntrfcID]
+			
+			# add alignment only for debugging
+			alignment = net.align_service_time(intrfc, flow_sim.round_float(evt_mgr.CurrentSeconds() + offset, flow_sim.rdigits), nm.MsgLen)
+			
+			# schedule exit from first interface after msg passes through
+			evt_mgr.Schedule(intrfc, nm, net.enter_egress_intrfc, vrtime.SecondsToTime(offset + alignment))
+
+	# SendImmediate schedules the message with zero latency
+	def send_immediate(self, evt_mgr: evtm.EventManager, nm: net.NetworkMsg):
+		# schedule exit from final interface after msg passes through
+		intrfc = mrnes.IntrfcByID[nm.Route[len(nm.Route)-1].dstIntrfcID]
+		device = intrfc.Device
+		nmbody = nm
+		net.ActivePortal.Depart(evt_mgr, device.DevName(), nmbody)
+
+	# PlaceNetMsg schedules the receipt of the message some deterministic time in the future,
+	# without going through the details of the intervening network structure
+	def place_net_msg(self, evt_mgr: evtm.EventManager, nm: net.NetworkMsg, offset: float):
+		# get the ingress interface at the end of the route
+		ingress_intrfc_id = nm.Route[len(nm.Route)-1].dstIntrfcID
+		ingress_intrfc = mrnes.IntrfcByID[ingress_intrfc_id]
+		
+		# compute the time through the network if simulated _now_ (and with no packets ahead in queue)
+		latency = self.compute_flow_latency(nm)
+		
+		# mark the message to indicate arrival at the destination
+		nm.StepIdx = len(nm.Route) - 1
+		
+		# schedule exit from final interface after msg passes through
+		evt_mgr.Schedule(ingress_intrfc, nm, net.enter_ingress_intrfc, vrtime.SecondsToTime(latency + offset))
+
+	# ComputeFlowLatency approximates the latency from source to destination if compute now,
+	# with the state of the network frozen and no packets queued up
+	def compute_flow_latency(self, nm):
+		
+		latency_type = nm.Connection.Latency
+		if latency_type == transition.ConnLatency.Zero:
+			return 0.0
+		
+		# the latency type will be 'Place' if we reach here
+		flow_id = nm.FlowID
+		
+		route = nm.Route
+		
+		frame_size = 1560
+		if nm.MsgLen < frame_size:
+			frame_size = nm.MsgLen
+		msg_len = float(frame_size * 8) / 1e6
+
+		# initialize latency with all the constants on the path
+		latency = self.LatencyConsts[flow_id]
+
+		for idx in range(len(route)):
+			rt_step = route[idx]
+			src_intrfc = mrnes.IntrfcByID[rt_step.srcIntrfcID]
+			latency += msg_len / src_intrfc.State.Bndwdth
+			
+			dst_intrfc = mrnes.IntrfcByID[rt_step.dstIntrfcID]
+			latency += msg_len / dst_intrfc.State.Bndwdth
+			
+			network_obj = src_intrfc.Faces
+			latency += network_obj.NetLatency(nm)
+		return latency
+	###################### END TRANSITION.PY METHODS #########################
 
 # ActivePortal remembers the most recent NetworkPortal created
 # (there should be only one call to CreateNetworkPortal...)
@@ -912,9 +1605,9 @@ class networkStruct:
 	A networkStruct holds the attributes of one of the model's communication subnetworks
 	"""
 	def __init__(self):
-		self.Name: 			str = ""        		# unique name
-		self.Groups: 		list[str] = []      	# list of groups to which network belongs
-		self.Number: 		int = 0       			# unique integer id
+		self.Name: 			str = ""				# unique name
+		self.Groups: 		list[str] = []	  	# list of groups to which network belongs
+		self.Number: 		int = 0	   			# unique integer id
 		self.NetScale: 		NetworkScale = None  	# type, e.g., LAN, WAN, etc.
 		self.NetMedia: 		NetworkMedia = None  	# communication fabric, e.g., wired, wireless
 		self.NetRouters: 	list[routerDev] = []  	# list of pointers to routerDevs with interfaces that face this subnetwork
@@ -1186,14 +1879,14 @@ class endptState:
 # a endptDev holds information about a endpt
 class endptDev:
 	def __init__(self):
-		self.EndptName: str = ""               # unique name
-		self.EndptGroups: list[str] = []       # list of groups to which endpt belongs
-		self.EndptModel: str = ""              # model of CPU the endpt uses
-		self.EndptCores: int = 0               # number of CPU cores
+		self.EndptName: str = ""			   # unique name
+		self.EndptGroups: list[str] = []	   # list of groups to which endpt belongs
+		self.EndptModel: str = ""			  # model of CPU the endpt uses
+		self.EndptCores: int = 0			   # number of CPU cores
 		self.EndptSched: TaskScheduler = None  					# shares an endpoint's cores among computing tasks
-		self.EndptAccelSched: dict[str, TaskScheduler] = {}     # map of accelerators, indexed by type name
-		self.EndptAccelModel: dict[str, str] = {}        		# accel device name on endpoint mapped to device model for timing
-		self.EndptID: int = 0                  					# unique integer id
+		self.EndptAccelSched: dict[str, TaskScheduler] = {}	 # map of accelerators, indexed by type name
+		self.EndptAccelModel: dict[str, str] = {}				# accel device name on endpoint mapped to device model for timing
+		self.EndptID: int = 0				  					# unique integer id
 		self.EndptIntrfcs: list[intrfcStruct] = []  # list of network interfaces embedded in the endpt
 		self.EndptState: endptState = None   		# a struct holding endpt state
 
@@ -1351,26 +2044,26 @@ class endptDev:
 class switchState:
 	def __init__(self):
 		self.Rngstrm: 'rngstream.RngStream' = None   # pointer to a random number generator
-		self.Trace: bool = False                    # switch for calling trace saving
-		self.Drop: bool = False                     # switch to allow dropping packets
-		self.Active: dict[int, float] = {}          # map of active connection IDs to rates
+		self.Trace: bool = False					# switch for calling trace saving
+		self.Drop: bool = False					 # switch to allow dropping packets
+		self.Active: dict[int, float] = {}		  # map of active connection IDs to rates
 		self.Load: float = 0.0
 		self.BufferSize: float = 0.0
 		self.Capacity: float = 0.0
-		self.Forward: DFS = {}                      # forwarding table
+		self.Forward: DFS = {}					  # forwarding table
 		self.Packets: int = 0
-		self.DefaultOp: dict[str, str] = {}         # default operation per source device
+		self.DefaultOp: dict[str, str] = {}		 # default operation per source device
 		self.DevExecOpTbl: dict[str, OpMethod] = {} # operation method table
 
 # The switchDev struct holds information describing a run-time representation of a switch
 class switchDev:
 	def __init__(self):
-		self.SwitchName: str = ""                  	# unique name
-		self.SwitchGroups: list[str] = []           # groups to which the switch may belong
-		self.SwitchModel: str = ""                 	# model name, used to identify performance characteristics
-		self.SwitchID: int = 0                      # unique integer id, generated at model-load time
+		self.SwitchName: str = ""				  	# unique name
+		self.SwitchGroups: list[str] = []		   # groups to which the switch may belong
+		self.SwitchModel: str = ""				 	# model name, used to identify performance characteristics
+		self.SwitchID: int = 0					  # unique integer id, generated at model-load time
 		self.SwitchIntrfcs: list[intrfcStruct] = [] # list of network interfaces embedded in the switch
-		self.SwitchState: switchState = None        # pointer to the switch's state struct
+		self.SwitchState: switchState = None		# pointer to the switch's state struct
 
 	# createSwitchDev is a constructor, initializing a run-time representation of a switch from its desc description
 	@staticmethod
@@ -1536,11 +2229,11 @@ class switchDev:
 class routerState:
 	def __init__(self):
 		self.Rngstrm: 'rngstream.RngStream' = None   # pointer to a random number generator
-		self.Trace: bool = False                    # switch for calling trace saving
-		self.Drop: bool = False                     # switch for allowing packet drops
+		self.Trace: bool = False					# switch for calling trace saving
+		self.Drop: bool = False					 # switch for allowing packet drops
 		self.Active: dict[int, float] = {}
 		self.Load: float = 0.0
-		self.Buffer: float = float('inf')           # default to a very large buffer
+		self.Buffer: float = float('inf')		   # default to a very large buffer
 		self.Forward: dict[int, 'intrfcIDPair'] = {}
 		self.Packets: int = 0
 		self.DefaultOp: dict[str, str] = {}
@@ -1549,12 +2242,12 @@ class routerState:
 # The routerDev struct holds information describing a run-time representation of a router
 class routerDev:
 	def __init__(self):
-		self.RouterName: str = ""                  # unique name
-		self.RouterGroups: list[str] = []           # list of groups to which the router belongs
-		self.RouterModel: str = ""                 # attribute used to identify router performance characteristics
-		self.RouterID: int = 0                      # unique integer id assigned at model-load time
+		self.RouterName: str = ""				  # unique name
+		self.RouterGroups: list[str] = []		   # list of groups to which the router belongs
+		self.RouterModel: str = ""				 # attribute used to identify router performance characteristics
+		self.RouterID: int = 0					  # unique integer id assigned at model-load time
 		self.RouterIntrfcs: list['intrfcStruct'] = [] # list of interfaces embedded in the router
-		self.RouterState: 'routerState' = None      # pointer to the struct of the routers auxiliary state
+		self.RouterState: 'routerState' = None	  # pointer to the struct of the routers auxiliary state
 
 	# createRouterDev is a constructor, initializing a run-time representation of a router from its desc representation
 	@staticmethod
@@ -1725,8 +2418,8 @@ class intrfcsToDev:
 	def __init__(self, srcIntrfcID: int, dstIntrfcID: int, netID: int, devID: int):
 		self.srcIntrfcID: int = srcIntrfcID  # id of the interface where the connection starts
 		self.dstIntrfcID: int = dstIntrfcID  # id of the interface embedded by the target device
-		self.netID: int = netID              # id of the network between the src and dst interfaces
-		self.devID: int = devID              # id of the device the connection targets
+		self.netID: int = netID			  # id of the network between the src and dst interfaces
+		self.devID: int = devID			  # id of the device the connection targets
 
 NetworkMsgID: int = 1
 
@@ -1736,29 +2429,29 @@ NetworkMsgID: int = 1
 # and the final value is a pointer to an inter-func comp pattern message.
 class NetworkMsg:
 	def __init__(self):
-		self.MsgID: int = 0                 # ID created message is delivered to network
-		self.MsrID: int = 0                 # measure identity ID from message delivered to network
-		self.StepIdx: int = 0               # position within the route from source to destination
+		self.MsgID: int = 0				 # ID created message is delivered to network
+		self.MsrID: int = 0				 # measure identity ID from message delivered to network
+		self.StepIdx: int = 0			   # position within the route from source to destination
 		self.Route: list[intrfcsToDev] = [] # pointer to description of route
 		self.Connection: 'ConnDesc' = None  # {DiscreteConn, MajorFlowConn, MinorFlowConn}
 		self.ExecID: int = 0
-		self.FlowID: int = 0                # flow id given by app at entry
-		self.ConnectID: int = 0             # connection identifier
+		self.FlowID: int = 0				# flow id given by app at entry
+		self.ConnectID: int = 0			 # connection identifier
 		self.NetMsgType: 'NetworkMsgType' = None # enum type packet,
-		self.PcktRate: float = 0.0          # rate from source
-		self.Rate: float = 0.0              # flow rate if FlowID >0 (meaning a flow)
-		self.Syncd: list[int] = []          # IDs of flows with which this message has synchronized
-		self.StartTime: float = 0.0         # simulation time when the message entered the network
-		self.PrArrvl: float = 0.0           # probability of arrival
-		self.MsgLen: int = 0                # length of the entire message, in bytes
-		self.PcktIdx: int = 0               # index of packet with msg
-		self.NumPckts: int = 0              # number of packets in the message this is part of
+		self.PcktRate: float = 0.0		  # rate from source
+		self.Rate: float = 0.0			  # flow rate if FlowID >0 (meaning a flow)
+		self.Syncd: list[int] = []		  # IDs of flows with which this message has synchronized
+		self.StartTime: float = 0.0		 # simulation time when the message entered the network
+		self.PrArrvl: float = 0.0		   # probability of arrival
+		self.MsgLen: int = 0				# length of the entire message, in bytes
+		self.PcktIdx: int = 0			   # index of packet with msg
+		self.NumPckts: int = 0			  # number of packets in the message this is part of
 		self.MetaData: dict[str, any] = {}  # carrier of extra stuff
-		self.Msg: any = None                # message being carried.
+		self.Msg: any = None				# message being carried.
 		self.intrfcArr: float = 0.0
 		self.StrmPckt: bool = False
-		self.prevIntrfcID: int = 0          # ID of interface through which message last passed
-		self.prevIntrfcSend: float = 0.0    # time at which message left previous interface
+		self.prevIntrfcID: int = 0		  # ID of interface through which message last passed
+		self.prevIntrfcSend: float = 0.0	# time at which message left previous interface
 
 	# carriesPckt returns a boolean indicating whether the message is a packet (verses flow)
 	def carries_pckt(self) -> bool:
@@ -1985,8 +2678,8 @@ def arrive_ingress_intrfc(evt_mgr: 'evtm.EventManager', ingress_intrfc: any, msg
 	# estimate the probability of dropping the packet on the way out
 	if net_dev_type == DevCode.RouterCode or net_dev_type == DevCode.SwitchCode:
 		nxt_intrfc = IntrfcByID[nmbody.Route[nm.StepIdx+1].srcIntrfcID]
-		buffer = nxt_intrfc.State.BufferSize                         # buffer size in Mbytes
-		N = int(round(buffer * 1e+6 / float(nmbody.MsgLen)))         # buffer length in Mbytes
+		buffer = nxt_intrfc.State.BufferSize						 # buffer size in Mbytes
+		N = int(round(buffer * 1e+6 / float(nmbody.MsgLen)))		 # buffer length in Mbytes
 		lambda_ = intrfc.State.IngressLambda
 		pr_drop = estPrDrop(lambda_, intrfc.State.Bndwdth, N)
 		nmbody.PrArrvl *= (1.0 - pr_drop)
@@ -2072,13 +2765,13 @@ def est_pr_drop(rate: float, capacity: float, N: int) -> float:
 	#
 	# with a bandwidth of rate Mbits/sec, the rate in pckts/sec is
 	#
-	#        Mbits
+	#		Mbits
 	#   rate ------
-	#         sec                      rate     pckts
-	#  -----------------------  =     ------    ----
-	#                 Mbits         (8*m/1e+6)   sec
-	#    (8*m/1e+6)  ------
-	#                  pckt
+	#		 sec					  rate	 pckts
+	#  -----------------------  =	 ------	----
+	#				 Mbits		 (8*m/1e+6)   sec
+	#	(8*m/1e+6)  ------
+	#				  pckt
 	#
 	# The number of packets that can be accepted at this rate in a period of L secs is
 	#
@@ -2164,7 +2857,7 @@ def dev_op_time_from_tbl(tbl: list['opTimeDesc'], op: str, model: str, msg_len: 
 		return value
 	
 	#   not in the cache, not in the table.  Estimate based on
-	#     pcktLen relative to sorted list of known packet lengths
+	#	 pcktLen relative to sorted list of known packet lengths
 	#   case len(pls) = 1 --- estimate based on straight line from origin to pls[0]
 	#   case: pcktLen < pls[0] and len(pls) > 1 --- use slope between pls[0] and pls[1]
 	#   case: pls[0] <= pcktLen < pls[len(pls)-1] --- do a linear interpolation
