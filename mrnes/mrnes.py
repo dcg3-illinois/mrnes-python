@@ -1,5 +1,5 @@
 import functools
-from typing import Dict, List, Callable, Any, Optional
+from typing import Dict, List, Callable, Any, Optional, Tuple
 import math
 import os
 from evt_python.evt import evtm
@@ -13,88 +13,98 @@ import param
 import flow
 
 
-# opTimeDesc: describes operation timing for a device
-class opTimeDesc:
-    def __init__(self, execTime: float, bndwdth: float, pcktLen: int):
-        self.execTime = execTime
+# OpTimeDesc: describes operation timing for a device
+class OpTimeDesc:
+    def __init__(self, exec_time: float, bndwdth: float, pckt_len: int):
+        self.exec_time = exec_time
         self.bndwdth = bndwdth
-        self.pcktLen = pcktLen
+        self.pckt_len = pckt_len
 
-# devExecTimeTbl: map[operation type][device model] -> list of opTimeDesc
-devExecTimeTbl: Dict[str, Dict[str, List[opTimeDesc]]] = {}
+# dev_exec_time_tbl: map[operation type][device model] -> list of OpTimeDesc
+dev_exec_time_tbl: Dict[str, Dict[str, List[OpTimeDesc]]] = {}
 # OpMethod: Callable type for device operation methods
 OpMethod = Callable[[net.TopoDev, str, net.NetworkMsg], float]
 
-# set up an empty method to test against when looking to follow the link to the OpMethod
-def emptyOpMethod(topo: net.TopoDev, arg: str, msg: net.NetworkMsg) -> float:
+# set up an empty method to test against when looking to follow the link 
+# to the OpMethod
+def empty_op_method(topo: net.TopoDev, arg: str, msg: net.NetworkMsg) -> float:
     return 0.0
 
-# first index is device name, second index is either SwitchOp or RouteOp from message
-devExecOpTbl: Dict[str, Dict[str, OpMethod]] = {}
+# first index is device name, second index is either SwitchOp or 
+# RouteOp from message
+dev_exec_op_tbl: Dict[str, Dict[str, OpMethod]] = {}
 
-# QkNetSim is set from the command line, when selected uses 'quick' form of network simulation
-QkNetSim: bool = False
+# qk_net_sim is set from the command line, when selected uses 'quick' 
+# form of network simulation
+qk_net_sim: bool = False
 
-DefaultInt: Dict[str, int] = {}
-DefaultFloat: Dict[str, float] = {}
-DefaultBool: Dict[str, bool] = {}
-DefaultStr: Dict[str, str] = {}
+default_int: Dict[str, int] = {}
+default_float: Dict[str, float] = {}
+default_bool: Dict[str, bool] = {}
+default_str: Dict[str, str] = {}
 
-# TaskSchedulerByHostName maps an identifier for the scheduler to the scheduler itself
-TaskSchedulerByHostName: Dict[str, scheduler.TaskScheduler] = {}
+# maps an identifier for the scheduler to the scheduler itself
+task_scheduler_by_host_name: Dict[str, scheduler.TaskScheduler] = {}
 
-# AccelSchedulersByHostName maps an identifier for the map of schedulers to the map
-AccelSchedulersByHostName: Dict[str, Dict[str, scheduler.TaskScheduler]] = {}
+# maps an identifier for the map of schedulers to the map
+accel_schedulers_by_host_name: Dict[str, Dict[str, scheduler.TaskScheduler]] = {}
 
-u01List: List[float] = []
-numU01: int = 10000
+u01_list: List[float] = []
+num_u01: int = 10000
 
-defaultIntrfcBndwdth: float = 100.0
-DefaultRouteOp: str = "route"
-DefaultSwitchOp: str = "switch"
+default_intrfc_bndwdth: float = 100.0
+default_route_op: str = "route"
+default_switch_op: str = "switch"
 
-def buildDevExecTimeTbl(detl) -> Dict[str, Dict[str, List[opTimeDesc]]]:
+def build_dev_exec_time_tbl(detl) -> Dict[str, Dict[str, List[OpTimeDesc]]]:
     """
-    buildDevExecTimeTbl creates a map structure that stores information about
+    build_dev_exec_time_tbl creates a map structure that stores information about
     operations on switches and routers.
     The organization is:
-        map[operation type] -> map[device model] -> list of execution times (including pcktlen and bndwdth)
+        map[operation type] -> map[device model] -> list of execution times 
+        (including pcktlen and bndwdth)
     """
-    det: Dict[str, Dict[str, List[opTimeDesc]]] = {}
+    det: Dict[str, Dict[str, List[OpTimeDesc]]] = {}
     
-    # the device timings are organized in the desc structure as a map indexed by operation type
-    # (e.g., "switch", "route")
-    for opType, mapList in detl.Times.items():
+    # the device timings are organized in the desc structure as a map indexed 
+    # by operation type (e.g., "switch", "route")
+    for op_type, map_list in detl.Times.items():
         
-        # initialize the value for map[opType] if needed
-        if opType not in det:
-            det[opType] = {}
+        # initialize the value for map[op_type] if needed
+        if op_type not in det:
+            det[op_type] = {}
 
-        # loop over all the records in the desc list associated with the dev op, getting and including the
-        # device 'model' identifier and the execution time
-        bndwdthByModel = {}
+        # loop over all the records in the desc list associated with the dev op,
+        # getting and including the device 'model' identifier and the execution
+        # time
+        bndwdth_by_model = {}
 
-        for devExecDesc in mapList:
-            model = devExecDesc.Model
-            bndwdth = devExecDesc.Bndwdth
+        for dev_exec_desc in map_list:
+            model = dev_exec_desc.Model
+            bndwdth = dev_exec_desc.Bndwdth
             
-            if model not in bndwdthByModel:
-                bndwdthByModel[model] = bndwdth
+            if model not in bndwdth_by_model:
+                bndwdth_by_model[model] = bndwdth
             
-            if abs(bndwdth - bndwdthByModel[model]) > 1e-3:
-                raise Exception(f"conflicting bndwdths in devOp {opType} for model {model}")
+            if abs(bndwdth - bndwdth_by_model[model]) > 1e-3:
+                raise Exception(f"conflicting bndwdths in devOp {op_type} for model {model}")
             
             if not (bndwdth > 0.0):
                 bndwdth = 1000.0
             
-            if model not in det[opType]:
-                det[opType][model] = []
+            if model not in det[op_type]:
+                det[op_type][model] = []
             
-            det[opType][model].append(opTimeDesc(execTime=devExecDesc.ExecTime, pcktLen=devExecDesc.PcktLen, bndwdth=bndwdth))
+            det[op_type][model].append(OpTimeDesc(
+                                    exec_time=dev_exec_desc.ExecTime, 
+                                    pckt_len=dev_exec_desc.PcktLen, 
+                                    bndwdth=bndwdth
+                                    )
+                                )
         
         # make sure that list is sorted by packet length
-        for model in det[opType]:
-            det[opType][model].sort(key=lambda x: x.pcktLen)
+        for model in det[op_type]:
+            det[op_type][model].sort(key=lambda x: x.pckt_len)
 
     # add default's for "switch" and "route"
     if "switch" not in det:
@@ -102,167 +112,182 @@ def buildDevExecTimeTbl(detl) -> Dict[str, Dict[str, List[opTimeDesc]]]:
     if "default" not in det["switch"]:
         det["switch"]["default"] = []
     if len(det["switch"]["default"]) == 0:
-        det["switch"]["default"].append(opTimeDesc(execTime=20e-6, pcktLen=0, bndwdth=defaultIntrfcBndwdth))
+        det["switch"]["default"].append(OpTimeDesc(exec_time=20e-6, 
+                                                   pckt_len=0, 
+                                                   bndwdth=default_intrfc_bndwdth
+                                                   ))
     
     if "route" not in det:
         det["route"] = {}
     if "default" not in det["route"]:
         det["route"]["default"] = []
     if len(det["route"]["default"]) == 0:
-        det["route"]["default"].append(opTimeDesc(execTime=100e-6, pcktLen=0, bndwdth=defaultIntrfcBndwdth))
+        det["route"]["default"].append(OpTimeDesc(exec_time=100e-6, 
+                                                  pckt_len=0, 
+                                                  bndwdth=default_intrfc_bndwdth
+                                                    ))
     return det
 
-devTraceMgr: trace.TraceManager = None  # type: Any
+dev_trace_mgr: trace.TraceManager = None  # type: Any
 
 # infrastructure for inter-func addressing (including x-compPattern addressing)
 
 class MrnesApp:
     # a globally unique name for the application
-    def GlobalName(self) -> str:
+    def global_name(self) -> str:
         raise NotImplementedError
     
     # an event handler to call to present a message to an app
-    def ArrivalFunc(self) -> evtm.EventHandlerFunction:
+    def arrival_func(self) -> evtm.EventHandlerFunction:
         raise NotImplementedError
 
-# NullHandler exists to provide as a link for data fields that call for
+# null_handler exists to provide as a link for data fields that call for
 # an event handler, but no event handler is actually needed
-def NullHandler(evtMgr: evtm.EventManager, context: Any, msg: Any) -> Any:
+def null_handler(evt_mgr: evtm.EventManager, context: Any, msg: Any) -> Any:
     return None
 
-# LoadTopo reads in a topology configuration file and creates from it internal data
-# structures representing the topology.  idCounter starts the enumeration of unique
-# topology object names, and traceMgr is needed to log the names and ids of all the topology objects into the trace dictionary
-def LoadTopo(topoFile: str, idCounter: int, traceMgr: trace.TraceManager) -> Optional[Exception]:
-    empty = bytes()
-    ext = os.path.splitext(topoFile)[1]
-    useYAML = ext in [".yaml", ".yml"]
+# load_topo reads in a topology configuration file and creates from it internal 
+# data structures representing the topology.  id_counter starts the enumeration 
+# of unique topology object names, and trace_mgr is needed to log the names and 
+# ids of all the topology objects into the trace dictionary
+def load_topo(topo_file: str, id_counter: int, 
+              trace_mgr: trace.TraceManager) -> Optional[Exception]:
+    global num_ids, dev_trace_mgr
 
-    tc, err = desc_topo.ReadTopoCfg(topoFile, useYAML, empty)
+    empty = bytes()
+    ext = os.path.splitext(topo_file)[1]
+    use_yaml = ext in [".yaml", ".yml"]
+
+    tc, err = desc_topo.read_topo_config(topo_file, use_yaml, empty)
 
     if err is not None:
         return err
-    
-    global NumIDs, devTraceMgr
 
-    # populate topology data structures that enable reference to the structures just read in
-    # initialize NumIDs for generation of unique device/network ids
-    NumIDs = idCounter
+    # populate topology data structures that enable reference to the structures 
+    # just read in initialize num_ids for generation of unique device/network ids
+    num_ids = id_counter
     
-    # put traceMgr in global variable for reference
-    devTraceMgr = traceMgr
-    createTopoReferences(tc, traceMgr)
+    # put trace_mgr in global variable for reference
+    dev_trace_mgr = trace_mgr
+    create_topo_references(tc, trace_mgr)
     return None
 
-# LoadDevExec reads in the device-oriented function timings, puts
-# them in a global table devExecTimeTbl
-def LoadDevExec(devExecFile: str) -> Optional[Exception]:
+# load_dev_exec reads in the device-oriented function timings, puts
+# them in a global table dev_exec_time_tbl
+def load_dev_exec(dev_exec_file: str) -> Optional[Exception]:
+    global dev_exec_time_tbl, dev_exec_op_tbl
+    
     empty = bytes()
-    ext = os.path.splitext(devExecFile)[1]
-    useYAML = ext in [".yaml", ".yml"]
-    del_, err = desc_topo.ReadDevExecList(devExecFile, useYAML, empty)
+    ext = os.path.splitext(dev_exec_file)[1]
+    use_yaml = ext in [".yaml", ".yml"]
+    del_, err = desc_topo.read_dev_exec_list(dev_exec_file, use_yaml, empty)
     if err is not None:
         return err
     
-    global devExecTimeTbl, devExecOpTbl
-    devExecTimeTbl = buildDevExecTimeTbl(del_)
-    devExecOpTbl = {}
+    dev_exec_time_tbl = build_dev_exec_time_tbl(del_)
+    dev_exec_op_tbl = {}
     return None
 
-# LoadStateParams takes the file names of a 'base' file of performance
+# load_state_params takes the file names of a 'base' file of performance
 # parameters (e.g., defaults) and a 'modify' file of performance parameters
 # to merge in (e.g. with higher specificity) and initializes the topology
 # elements state structures with these.
-def LoadStateParams(base: str) -> Optional[Exception]:
+def load_state_params(base: str) -> Optional[Exception]:
     empty = bytes()
     ext = os.path.splitext(base)[1]
-    useYAML = ext in [".yaml", ".yml"]
+    use_yaml = ext in [".yaml", ".yml"]
 
-    xd, err = param.ReadExpCfg(base, useYAML, empty)
+    xd, err = param.read_exp_cfg(base, use_yaml, empty)
     if err is not None:
         return err
     
     # use configuration parameters to initialize topology state
-    SetTopoState(xd)
+    set_topo_state(xd)
     return None
 
-def BuildExperimentNet(evtMgr: evtm.EventManager, dictFiles: Dict[str, str], useYAML: bool, idCounter: int, traceMgr: trace.TraceManager):
+def build_experiment_net(evt_mgr: evtm.EventManager, dict_files: Dict[str, str],
+                        use_yaml: bool, id_counter: int, 
+                        trace_mgr: trace.TraceManager):
     """
-    BuildExperimentNet bundles the functions of LoadTopo, LoadDevExec, and LoadStateParams
+    build_experiment_net bundles the functions of load_topo, load_dev_exec, and 
+    load_state_params
     """
-    topoFile = dictFiles["topo"]
-    devExecFile = dictFiles["devExec"]
-    baseFile = dictFiles["exp"]
+    global u01_list
+    
+    topo_file = dict_files["topo"]
+    dev_exec_file = dict_files["devExec"]
+    base_file = dict_files["exp"]
 
     flow.init_flow_list()
 
     # load device execution times first so that initialization of
     # topo interfaces get access to device timings
-    err1 = LoadDevExec(devExecFile)
-    err2 = LoadTopo(topoFile, idCounter, traceMgr)
-    err3 = LoadStateParams(baseFile)
+    err1 = load_dev_exec(dev_exec_file)
+    err2 = load_topo(topo_file, id_counter, trace_mgr)
+    err3 = load_state_params(base_file)
 
-    bckgrndRNG = rngstream.New("bckgrnd")
-    global u01List
-    u01List = [bckgrndRNG.RandU01() for _ in range(numU01)]
+    bckgrnd_rng = rngstream.New("bckgrnd")
+    
+    u01_list = [bckgrnd_rng.RandU01() for _ in range(num_u01)]
 
     errs = [err1, err2, err3]
 
-    flow.start_flows(evtMgr)
+    flow.start_flows(evt_mgr)
 
     # note that None is returned if all errors are None
-    return desc_topo.ReportErrs(errs)
+    return desc_topo.report_errs(errs)
 
 # helper function to compare sg list elements
 def sg_compare(a, b):
-    cmp = param.CompareAttrbs(a.Attributes, b.Attributes)
-    if(cmp == -1):
+    cmp = param.compare_attrbs(a.attributes, b.attributes)
+    if cmp == -1:
         return True
     else:
         return False
 
 # helper function to compare nm list elements
 def nm_compare(a, b):
-    cmp = param.CompareAttrbs(a.Attributes, b.Attributes)
+    cmp = param.compare_attrbs(a.attributes, b.attributes)
     if(cmp == -1):
         return True
     elif(cmp == 1):
         return False
 
-    if(a.Param < b.Param):
+    if(a.param < b.param):
         return True
-    elif(a.Param > b.Param):
+    elif(a.param > b.param):
         return False
-    return a.Value < b.Value
+    return a.value < b.value
 
-def reorderExpParams(pL):
+def reorder_exp_params(param_list):
     """
-    reorderExpParams is used to put the ExpParameter parameters in
+    reorder_exp_params is used to put the ExpParameter parameters in
     an order such that the earlier elements in the order have broader
-    range of attributes than later ones that apply to the same configuration element.
-    This is entirely the same idea as is the approach of choosing a routing rule that has the
-    smallest subnet range, when multiple rules apply to the same IP address
+    range of attributes than later ones that apply to the same configuration
+    element. This is entirely the same idea as is the approach of choosing a 
+    routing rule that has the smallest subnet range, when multiple rules apply 
+    to the same IP address
     """
-    # partition the list into three sublists: wildcard (wc), single (sg), and named (nm).
-    # The wildcard elements always appear before any others, and the named elements always
-    # appear after all the others.
+    # partition the list into three sublists: wildcard (wc), single (sg), and 
+    # named (nm). The wildcard elements always appear before any others, and
+    # the named elements always appear after all the others.
     wc: List[param.ExpParameter] = []
     nm: List[param.ExpParameter] = []
     sg: List[param.ExpParameter] = []
 
     # assign wc, sg, or nm based on attribute
-    for param in pL:
+    for param in param_list:
         assigned = False
 
         # each parameter assigned to one of three lists
-        for attrb in param.Attributes:
+        for attrb in param.attributes:
             # wildcard list?
-            if attrb.AttrbName == "*":
+            if attrb.attrb_name == "*":
                 wc.append(param)
                 assigned = True
                 break
             # name list?
-            elif attrb.AttrbName == "name":
+            elif attrb.attrb_name == "name":
                 nm.append(param)
                 assigned = True
                 break
@@ -270,11 +295,13 @@ def reorderExpParams(pL):
         if not assigned:
             sg.append(param)
 
-    # we do further rearrangement to bring identical elements together for detection and cleanup.
-    # The wild card entries are identical in the ParamObj and Attribute fields, so order them based on the parameter.
-    wc.sort(key=lambda x: x.Param)
+    # we do further rearrangement to bring identical elements together for
+    # detection and cleanup.
+    # The wild card entries are identical in the ParamObj and Attribute fields, 
+    # so order them based on the parameter.
+    wc.sort(key=lambda x: x.param)
 
-    # sort the sg elements by (Attribute, Param) key
+    # sort the sg elements by Attribute key
     sg.sort(key=functools.cmp_to_key(sg_compare))
 
     # sort the named elements by the (Attribute, Param) key
@@ -293,248 +320,275 @@ def reorderExpParams(pL):
     return ordered
 
 
-def SetTopoState(expCfg: param.ExpCfg):
+def set_topo_state(exp_cfg: param.ExpCfg):
     """
-    SetTopoState creates the state structures for the devices before initializing from configuration files
+    set_topo_state creates the state structures for the devices before 
+    initializing from configuration files
     """
-    SetTopoParameters(expCfg)
+    set_topo_parameters(exp_cfg)
 
 
-def SetTopoParameters(expCfg):
+def set_topo_parameters(exp_cfg):
     """
-    SetTopoParameters takes the list of parameter configurations expressed in
+    set_topo_parameters takes the list of parameter configurations expressed in
     ExpCfg form, turns its elements into configuration commands that may
     initialize multiple objects, includes globally applicable assignments
     and assign these in greatest-to-least application order
     """
     # this call initializes some maps used below
-    param.GetExpParamDesc()
+    param.get_exp_param_desc()
 
-    # defaultParamList will hold initial ExpParameter specifications for
+    # default_param_list will hold initial ExpParameter specifications for
     # all parameter types. Some of these will be overwritten by more
     # specified assignments
-    defaultParamList = []
-    for paramObj in param.ExpParamObjs:
-        for param in param.ExpParams[paramObj]:
+    default_param_list = []
+    # TODO: access of global variable from different file
+    for param_obj in param.exp_param_objs:
+        for p in param.exp_params[param_obj]:
             vs = ""
-            if param == "switch":
+            if p == "switch":
                 vs = "10e-6"
-            elif param == "latency":
+            elif p == "latency":
                 vs = "10e-3"
-            elif param == "delay":
+            elif p == "delay":
                 vs = "10e-6"
-            elif param == "bandwidth":
+            elif p == "bandwidth":
                 vs = "10"
-            elif param == "buffer":
+            elif p == "buffer":
                 vs = "100"
-            elif param == "capacity":
+            elif p == "capacity":
                 vs = "10"
-            elif param == "MTU":
+            elif p == "MTU":
                 vs = "1560"
-            elif param == "trace":
+            elif p == "trace":
                 vs = "false"
             
             if len(vs) > 0:
-                wcAttrb = [param.AttrbStruct(AttrbName="*", AttrbValue="")]
-                expParam = param.ExpParameter(ParamObj=paramObj, Attributes=wcAttrb, Param=param, Value=vs)
-                defaultParamList.append(expParam)
+                wc_attrb = [param.AttrbStruct(attrb_name="*", attrb_value="")]
+                exp_param = param.ExpParameter(param_obj=param_obj, 
+                                               attributes=wc_attrb, 
+                                               param=p, 
+                                               value=vs)
+                default_param_list.append(exp_param)
 
     # separate the parameters into the ParamObj groups they apply to
-    endptParams: List[param.ExpParameter] = []
-    netParams: List[param.ExpParameter] = []
-    rtrParams: List[param.ExpParameter] = []
-    swtchParams: List[param.ExpParameter] = []
-    intrfcParams: List[param.ExpParameter] = []
-    flowParams: List[param.ExpParameter] = []
+    endpt_params: List[param.ExpParameter] = []
+    net_params: List[param.ExpParameter] = []
+    rtr_params: List[param.ExpParameter] = []
+    swtch_params: List[param.ExpParameter] = []
+    intrfc_params: List[param.ExpParameter] = []
+    flow_params: List[param.ExpParameter] = []
 
-    for param in expCfg.Parameters:
-        if param.ParamObj == "Endpoint":
-            endptParams.append(param)
-        elif param.ParamObj == "Router":
-            rtrParams.append(param)
-        elif param.ParamObj == "Switch":
-            swtchParams.append(param)
-        elif param.ParamObj == "Interface":
-            intrfcParams.append(param)
-        elif param.ParamObj == "Network":
-            netParams.append(param)
-        elif param.ParamObj == "Flow":
-            flowParams.append(param)
+    for p in exp_cfg.parameters:
+        if p.param_obj == "Endpoint":
+            endpt_params.append(p)
+        elif p.param_obj == "Router":
+            rtr_params.append(p)
+        elif p.param_obj == "Switch":
+            swtch_params.append(p)
+        elif p.param_obj == "Interface":
+            intrfc_params.append(p)
+        elif p.param_obj == "Network":
+            net_params.append(p)
+        elif p.param_obj == "Flow":
+            flow_params.append(p)
         else:
             raise Exception("surprise ParamObj")
 
-    # reorder each list to assure the application order of most-general-first, and remove duplicates
-    endptParams = reorderExpParams(endptParams)
-    rtrParams = reorderExpParams(rtrParams)
-    swtchParams = reorderExpParams(swtchParams)
-    intrfcParams = reorderExpParams(intrfcParams)
-    netParams = reorderExpParams(netParams)
-    flowParams = reorderExpParams(flowParams)
+    # reorder each list to assure the application order of most-general-first, 
+    # and remove duplicates
+    endpt_params = reorder_exp_params(endpt_params)
+    rtr_params = reorder_exp_params(rtr_params)
+    swtch_params = reorder_exp_params(swtch_params)
+    intrfc_params = reorder_exp_params(intrfc_params)
+    net_params = reorder_exp_params(net_params)
+    flow_params = reorder_exp_params(flow_params)
 
-    # concatenate defaultParamList and these lists. Note that this places the defaults
-    # we created above before any defaults read in from file, so that if there are conflicting
-    # default assignments the one the user put in the startup file will be applied after the
-    # default default we create in this program
-    orderedParamList = defaultParamList + endptParams + rtrParams + swtchParams + intrfcParams + netParams + flowParams
+    # concatenate default_param_list and these lists. Note that this places the 
+    # defaults we created above before any defaults read in from file, so that 
+    # if there are conflicting default assignments the one the user put in the 
+    # startup file will be applied after the default default we create in this 
+    # program
+    ordered_param_list = default_param_list \
+                         + endpt_params \
+                         + rtr_params \
+                         + swtch_params \
+                         + intrfc_params \
+                         + net_params \
+                         + flow_params
 
-    # get the names of all network objects, separated by their network object type
-    switchList: List[net.paramObj] = list(SwitchDevByID.values())
-    routerList: List[net.paramObj] = list(RouterDevByID.values())
-    endptList: List[net.paramObj] = list(EndptDevByID.values())
-    netList: List[net.paramObj] = list(NetworkByID.values())
-    flowList: List[net.paramObj] = list(FlowByID.values())
-    intrfcList: List[net.paramObj] = list(IntrfcByID.values())
+    # get the names of all network objects, separated by their 
+    # network object type
+    switch_list: List[net.paramObj] = list(switch_dev_by_id.values())
+    router_list: List[net.paramObj] = list(router_dev_by_id.values())
+    endpt_list: List[net.paramObj] = list(endpt_dev_by_id.values())
+    net_list: List[net.paramObj] = list(network_by_id.values())
+    flow_list: List[net.paramObj] = list(flow_by_id.values())
+    intrfc_list: List[net.paramObj] = list(intrfc_by_id.values())
 
-    # go through the sorted list of parameter assignments, more general before more specific
-    for param in orderedParamList:
-        # create a list that limits the objects to test to those that have required type
-        if param.ParamObj == "Switch":
-            testList = switchList
-        elif param.ParamObj == "Router":
-            testList = routerList
-        elif param.ParamObj == "Endpoint":
-            testList = endptList
-        elif param.ParamObj == "Interface":
-            testList = intrfcList
-        elif param.ParamObj == "Network":
-            testList = netList
-        elif param.ParamObj == "Flow":
-            testList = flowList
+    # go through the sorted list of parameter assignments, more general 
+    # before more specific
+    for p in ordered_param_list:
+        # create a list that limits the objects to test to those that have 
+        # required type
+        if p.param_obj == "Switch":
+            test_list = switch_list
+        elif p.param_obj == "Router":
+            test_list = router_list
+        elif p.param_obj == "Endpoint":
+            test_list = endpt_list
+        elif p.param_obj == "Interface":
+            test_list = intrfc_list
+        elif p.param_obj == "Network":
+            test_list = net_list
+        elif p.param_obj == "Flow":
+            test_list = flow_list
         else:
             continue
 
-        testObjType = param.ParamObj
+        test_obj_type = p.param_obj
 
-        # for every object in the constrained list test whether the attributes match.
-        # Observe that
-        #	 - * denotes a wild card
+        # for every object in the constrained list test whether the
+        # attributes match. Observe that
+        #   - * denotes a wild card
         #   - a set of attributes all of which need to be matched by the object
         #     is expressed as a comma-separated list
-        #   - If a name "Fred" is given as an attribute, what is specified is "name%%Fred"
-        for testObj in testList:
+        #   - If a name "Fred" is given as an attribute, what is specified is 
+        #     "name%%Fred"
+        for test_obj in test_list:
             # separate out the items in a comma-separated list
-            
             matched = True
-            for attrb in param.Attributes:
-                attrbName = attrb.AttrbName
-                attrbValue = attrb.AttrbValue
+            for attrb in p.attributes:
+                attrb_name = attrb.attrb_name
+                attrb_value = attrb.attrb_value
 
                 # wild card means set.  Should be the case that if '*' is present
                 # there is nothing else, but '*' overrides all
-                if attrbName == "*":
+                if attrb_name == "*":
                     matched = True
-                    defaultName = testObjType + "-" + attrbName
-                    defaultValue, defaultTypes = stringToValueStruct(attrbValue)
-                    for vtype in defaultTypes:
+                    default_name = test_obj_type + "-" + attrb_name
+                    default_value, default_types = string_to_value_struct(
+                                                                    attrb_value)
+                    for vtype in default_types:
                         if vtype == "int":
-                            DefaultInt[defaultName] = defaultValue.intValue
+                            default_int[default_name] = default_value.int_value
                         elif vtype == "float":
-                            DefaultFloat[defaultName] = defaultValue.floatValue
+                            default_float[default_name] = default_value.float_value
                         elif vtype == "bool":
-                            DefaultBool[defaultName] = defaultValue.boolValue
+                            default_bool[default_name] = default_value.bool_value
                         elif vtype == "string":
-                            DefaultStr[defaultName] = defaultValue.stringValue
+                            default_str[default_name] = default_value.string_value
                     break
 
                 # if any of the attributes don't match we don't match
-                if not testObj.matchParam(attrbName, attrbValue):
+                if not test_obj.match_param(attrb_name, attrb_value):
                     matched = False
                     break
-            
+
             # this object passed the match test so apply the parameter value
             if matched:
                 # the parameter value might be a string, or float, or bool.
-                # stringToValue figures it out and returns value assignment in vs
-                vs, _ = stringToValueStruct(param.Value)
-                testObj.setParam(param.Param, vs)
+                # string_to_value_struct figures it out and returns value
+                # assignment in vs
+                vs, _ = string_to_value_struct(p.value)
+                test_obj.set_param(p.param, vs)
 
 # TODO: I think this isn't correct because floats would be misidentified as ints
-def stringToValueStruct(v):
+def string_to_value_struct(v) -> Tuple[param.valueStruct, List[str]]:
     """
-    stringToValueStruct takes a string (used in the run-time configuration phase)
-    and determines whether it is an integer, floating point, or a string
+    string_to_value_struct takes a string (used in the run-time 
+    configuration phase) and determines whether it is an integer, 
+    floating point, or a string
     """
-    vs = param.valueStruct(intValue=0, floatValue=0.0, stringValue="", boolValue=False)
-    try:
-        # try conversion to int
-        ivalue = int(v)
-        vs.intValue = ivalue
+    vs = param.valueStruct(int_value=0, 
+                           float_value=0.0, 
+                           string_value="", 
+                           bool_value=False)
+    # treat as integer only if it's a strict integer literal (no dots/exponent)
+    s = v.strip()
+    if s and ((s[0] in "+-" and s[1:].isdigit()) or s.isdigit()):
+        ivalue = int(s)
+        vs.int_value = ivalue
         if ivalue == 1:
-            vs.boolValue = True
-        vs.floatValue = float(ivalue)
+            vs.bool_value = True
+        vs.float_value = float(ivalue)
         return vs, ["int", "float"]
-    except Exception:
-        pass
 
     try:
         # try conversion to float
         fvalue = float(v)
-        vs.floatValue = fvalue
+        vs.float_value = fvalue
         return vs, ["float"]
     except Exception:
         pass
 
     # left with it being a string. Check if it's true
     if v == "true" or v == "True":
-        vs.boolValue = True
+        vs.bool_value = True
         return vs, ["bool"]
-    
-    vs.stringValue = v
+
+    vs.string_value = v
     return vs, ["string"]
 
 # global variables for finding things given an id, or a name
-paramObjByID: Dict[int, net.paramObj] = {}
-paramObjByName: Dict[str, net.paramObj] = {}
+param_obj_by_id: Dict[int, net.paramObj] = {}
+param_obj_by_name: Dict[str, net.paramObj] = {}
 
-RouterDevByID: Dict[int, net.routerDev] = {}
-RouterDevByName: Dict[str, net.routerDev] = {}
+router_dev_by_id: Dict[int, net.routerDev] = {}
+router_dev_by_name: Dict[str, net.routerDev] = {}
 
-EndptDevByID: Dict[int, net.endptDev] = {}
-EndptDevByName: Dict[str, net.endptDev] = {}
+endpt_dev_by_id: Dict[int, net.endptDev] = {}
+endpt_dev_by_name: Dict[str, net.endptDev] = {}
 
-SwitchDevByID: Dict[int, net.switchDev] = {}
-SwitchDevByName: Dict[str, net.switchDev] = {}
+switch_dev_by_id: Dict[int, net.switchDev] = {}
+switch_dev_by_name: Dict[str, net.switchDev] = {}
 
-FlowByID: Dict[int, flow.Flow] = {}
-FlowByName: Dict[str, flow.Flow] = {}
+flow_by_id: Dict[int, flow.Flow] = {}
+flow_by_name: Dict[str, flow.Flow] = {}
 
-NetworkByID: Dict[int, net.networkStruct] = {}
-NetworkByName: Dict[str, net.networkStruct] = {}
+network_by_id: Dict[int, net.networkStruct] = {}
+network_by_name: Dict[str, net.networkStruct] = {}
 
-IntrfcByID: Dict[int, net.intrfcStruct] = {}
-IntrfcByName: Dict[str, net.intrfcStruct] = {}
+intrfc_by_id: Dict[int, net.intrfcStruct] = {}
+intrfc_by_name: Dict[str, net.intrfcStruct] = {}
 
-TopoDevByID: Dict[int, net.TopoDev] = {}
-TopoDevByName: Dict[str, net.TopoDev] = {}
+topo_dev_by_id: Dict[int, net.TopoDev] = {}
+topo_dev_by_name: Dict[str, net.TopoDev] = {}
 
-topoGraph: Dict[int, List[int]] = {}
+topo_graph: Dict[int, List[int]] = {}
 
-# indices of directedTopoGraph are ids derived from position in directedNodes slide
-directedTopoGraph: Dict[int, List[int]] = {}
+# indices of directed_topo_graph are ids derived from position in 
+# directed_nodes slide
+directed_topo_graph: Dict[int, List[int]] = {}
 
-# index of the directed node is its identity.  The 'i' component of the intPair is its devID, j is 0 if the source, 1 if dest
-directedNodes: List[net.intPair] = []
+# index of the directed node is its identity.  The 'i' component of 
+# the intPair is its devID, j is 0 if the source, 1 if dest
+directed_nodes: List[net.intPair] = []
 
-# index is devID, i component of intPair is directed id of source, j is directed id of destination
-devIDToDirected: Dict[int, List[net.intPair]] = {}
+# index is devID, i component of intPair is directed id of source, 
+# j is directed id of destination
+dev_id_to_directed: Dict[int, List[net.intPair]] = {}
 
-directedIDToDev: Dict[int, int] = {}
+directed_id_to_dev: Dict[int, int] = {}
 
-NumIDs = 0
+num_ids = 0
 
-def nxtID():
+def nxt_id():
     """
-    nxtID creates an id for objects created within mrnes module that are unique among those objects
+    nxt_id creates an id for objects created within mrnes module 
+    that are unique among those objects
     """
-    global NumIDs
-    NumIDs += 1
-    return NumIDs
+    global num_ids
+    num_ids += 1
+    return num_ids
 
 
-def GetExperimentNetDicts(dictFiles):
+def get_experiment_net_dicts(dict_files):
     """
-    GetExperimentNetDicts accepts a map that holds the names of the input files used for the network part of an experiment,
-    creates internal representations of the information they hold, and returns those structs.
+    get_experiment_net_dicts accepts a map that holds the names of 
+    the input files used for the network part of an experiment,
+    creates internal representations of the information they hold, 
+    and returns those structs.
     """
     tc: desc_topo.TopoCfg = None
     del_: desc_topo.DevExecList = None
@@ -545,52 +599,61 @@ def GetExperimentNetDicts(dictFiles):
 
     errs = []
     
-    useYAML = False
+    use_yaml = False
     
-    ext = os.path.splitext(dictFiles["topo"])[1]
-    useYAML = ext in [".yaml", ".yml"]
+    ext = os.path.splitext(dict_files["topo"])[1]
+    use_yaml = ext in [".yaml", ".yml"]
 
-    tc, err = desc_topo.ReadTopoCfg(dictFiles["topo"], useYAML, empty)
+    tc, err = desc_topo.read_topo_cfg(dict_files["topo"], 
+                                      use_yaml, 
+                                      empty
+                                    )
     errs.append(err)
 
-    ext = os.path.splitext(dictFiles["devExec"])[1]
-    useYAML = ext in [".yaml", ".yml"]
+    ext = os.path.splitext(dict_files["devExec"])[1]
+    use_yaml = ext in [".yaml", ".yml"]
 
-    del_, err = desc_topo.ReadDevExecList(dictFiles["devExec"], useYAML, empty)
+    del_, err = desc_topo.read_dev_exec_list(dict_files["devExec"], 
+                                             use_yaml, 
+                                             empty
+                                            )
     errs.append(err)
 
-    ext = os.path.splitext(dictFiles["exp"])[1]
-    useYAML = ext in [".yaml", ".yml"]
+    ext = os.path.splitext(dict_files["exp"])[1]
+    use_yaml = ext in [".yaml", ".yml"]
 
-    xd, err = param.ReadExpCfg(dictFiles["exp"], useYAML, empty)
+    xd, err = param.read_exp_cfg(dict_files["exp"], use_yaml, empty)
     errs.append(err)
 
-    err = desc_topo.ReportErrs(errs)
+    err = desc_topo.report_errs(errs)
     if err is not None:
         raise Exception(err)
 
     # ensure that the configuration parameter lists are built
-    param.GetExpParamDesc()
+    param.get_exp_param_desc()
 
     return tc, del_, xd, xdx
 
 
-def connectDirectedIds(dtg: Dict[int, List[int]], id1: int, id2: int):
+def connect_directed_ids(dtg: Dict[int, List[int]], id1: int, id2: int):
     # shouldn't happen
     if id1 == id2:
         return
     
     # create edge from source version of id1 to destination version of id2
-    srcDevID = devIDToDirected[id1].i
-    dstDevID = devIDToDirected[id2].j
-    dtg.setdefault(srcDevID, []).append(dstDevID)
+    src_dev_id = dev_id_to_directed[id1].i
+    dst_dev_id = dev_id_to_directed[id2].j
+    dtg.setdefault(src_dev_id, []).append(dst_dev_id)
 
-# connectIds remembers the asserted communication linkage between
+# connect_ids remembers the asserted communication linkage between
 # devices with given id numbers through modification of the input map tg
-def connectIds(tg: Dict[int, List[int]], id1: int, id2: int, intrfc1: int, intrfc2: int):
-    global routeStepIntrfcs
-    if 'routeStepIntrfcs' not in globals() or routeStepIntrfcs is None:
-        routeStepIntrfcs = {}
+def connect_ids(tg: Dict[int, List[int]], 
+                id1: int, id2: int, 
+                intrfc1: int, intrfc2: int):
+    
+    global route_step_intrfcs
+    if 'route_step_intrfcs' not in globals() or route_step_intrfcs is None:
+        route_step_intrfcs = {}
 
     # don't save connections to self if offered
     if id1 == id2:
@@ -603,373 +666,403 @@ def connectIds(tg: Dict[int, List[int]], id1: int, id2: int, intrfc1: int, intrf
     # add id1 to id2's list of peers, if not already present
     if id1 not in tg.get(id2, []):
         tg.setdefault(id2, []).append(id1)
-    routeStepIntrfcs[net.intPair(i=id1, j=id2)] = net.intPair(i=intrfc1, j=intrfc2)
+    route_step_intrfcs[net.intPair(i=id1, j=id2)] = net.intPair(i=intrfc1, 
+                                                                j=intrfc2)
 
-def createTopoReferences(topoCfg, tm):
+# this jawn creates all of our dictionaries and lists
+def create_topo_references(topo_cfg: desc_topo.TopoCfg, tm: trace.TraceManager):
     """
-    createTopoReferences reads from the input TopoCfg file to create references
+    create_topo_references reads from the input TopoCfg file to create references
     """
-    global TopoDevByID, TopoDevByName, paramObjByID, paramObjByName
-    global EndptDevByID, EndptDevByName, SwitchDevByID, SwitchDevByName
-    global RouterDevByID, RouterDevByName, NetworkByID, NetworkByName
-    global FlowByID, FlowByName, IntrfcByID, IntrfcByName
-    global topoGraph, directedTopoGraph, directedNodes, devIDToDirected, directedIDToDev
+    global topo_dev_by_id, topo_dev_by_name, param_obj_by_id, param_obj_by_name
+    global endpt_dev_by_id, endpt_dev_by_name, switch_dev_by_id, switch_dev_by_name
+    global router_dev_by_id, router_dev_by_name, network_by_id, network_by_name
+    global flow_by_id, flow_by_name, intrfc_by_id, intrfc_by_name
+    global topo_graph, directed_topo_graph, directed_nodes
+    global dev_id_to_directed, directed_id_to_dev
 
     # initialize the maps and slices used for object lookup
-    TopoDevByID = {}
-    TopoDevByName = {}
+    topo_dev_by_id = {}
+    topo_dev_by_name = {}
     
-    paramObjByID = {}
-    paramObjByName = {}
+    param_obj_by_id = {}
+    param_obj_by_name = {}
     
-    EndptDevByID = {}
-    EndptDevByName = {}
+    endpt_dev_by_id = {}
+    endpt_dev_by_name = {}
     
-    SwitchDevByID = {}
-    SwitchDevByName = {}
+    switch_dev_by_id = {}
+    switch_dev_by_name = {}
     
-    RouterDevByID = {}
-    RouterDevByName = {}
+    router_dev_by_id = {}
+    router_dev_by_name = {}
     
-    NetworkByID = {}
-    NetworkByName = {}
+    network_by_id = {}
+    network_by_name = {}
     
-    FlowByID = {}
-    FlowByName = {}
+    flow_by_id = {}
+    flow_by_name = {}
     
-    IntrfcByID = {}
-    IntrfcByName = {}
+    intrfc_by_id = {}
+    intrfc_by_name = {}
     
-    topoGraph = {}
-    directedTopoGraph = {}
-    directedNodes = []
-    devIDToDirected = {}
-    directedIDToDev = {}
+    topo_graph = {}
+    directed_topo_graph = {}
+    directed_nodes = []
+    dev_id_to_directed = {}
+    directed_id_to_dev = {}
 
     # fetch the router descriptions
-    for rtr in topoCfg.Routers:
+    for rtr in topo_cfg.routers:
         # create a runtime representation from its desc representation
-        rtrDev = net.createRouterDev(rtr)
+        rtr_dev = net.create_router_dev(rtr)
         
         # get name and id
-        rtrName = rtrDev.RouterName
-        rtrID = rtrDev.RouterID
-        
-        # add rtrDev to TopoDev map
-        # save rtrDev for lookup by Id and Name
+        rtr_name = rtr_dev.router_name
+        rtr_id = rtr_dev.router_id
+
+        # add rtr_dev to TopoDev map
+        # save rtr_dev for lookup by Id and Name
         # for TopoDev interface
-        addTopoDevLookup(rtrID, rtrName, rtrDev)
-        RouterDevByID[rtrID] = rtrDev
-        RouterDevByName[rtrName] = rtrDev
+        add_topo_dev_lookup(rtr_id, rtr_name, rtr_dev)
+        router_dev_by_id[rtr_id] = rtr_dev
+        router_dev_by_name[rtr_name] = rtr_dev
         
         # for paramObj interface
-        paramObjByID[rtrID] = rtrDev
-        paramObjByName[rtrName] = rtrDev
+        param_obj_by_id[rtr_id] = rtr_dev
+        param_obj_by_name[rtr_name] = rtr_dev
 
         # store id -> name for trace
-        tm.AddName(rtrID, rtrName, "router")
+        tm.add_name(rtr_id, rtr_name, "router")
 
     # fetch the switch descriptions
-    for swtch in topoCfg.Switches:
+    for swtch in topo_cfg.switches:
         # create a runtime representation from its desc representation
-        switchDev = net.switchDev.create_switch_dev(swtch)
+        switch_dev = net.switchDev.create_switch_dev(swtch)
 
         # get name and id
-        switchName = switchDev.SwitchName
-        switchID = switchDev.SwitchID
+        switch_name = switch_dev.switch_name
+        switch_id = switch_dev.switch_id
 
-        # save switchDev for lookup by Id and Name
+        # save switch_dev for lookup by Id and Name
         # for TopoDev interface
-        addTopoDevLookup(switchID, switchName, switchDev)
-        SwitchDevByID[switchID] = switchDev
-        SwitchDevByName[switchName] = switchDev
+        add_topo_dev_lookup(switch_id, switch_name, switch_dev)
+        switch_dev_by_id[switch_id] = switch_dev
+        switch_dev_by_name[switch_name] = switch_dev
 
         # for paramObj interface
-        paramObjByID[switchID] = switchDev
-        paramObjByName[switchName] = switchDev
+        param_obj_by_id[switch_id] = switch_dev
+        param_obj_by_name[switch_name] = switch_dev
 
         # store id -> name for trace
-        tm.AddName(switchID, switchName, "switch")
+        tm.add_name(switch_id, switch_name, "switch")
 
     # fetch the endpt descriptions
-    for endpt in topoCfg.Endpts:
+    for endpt in topo_cfg.endpts:
         # create a runtime representation from its desc representation
-        endptDev = net.endptDev.create_endpt_dev(endpt)
-        endptDev.initTaskScheduler()
+        endpt_dev = net.endptDev.create_endpt_dev(endpt)
+        endpt_dev.init_task_scheduler()
 
         # get name and id
-        endptName = endptDev.EndptName
-        endptID = endptDev.EndptID
-        
-        # save endptDev for lookup by Id and Name
+        endpt_name = endpt_dev.endpt_name
+        endpt_id = endpt_dev.endpt_id
+
+        # save endpt_dev for lookup by Id and Name
         # for TopoDev interface
-        addTopoDevLookup(endptID, endptName, endptDev)
-        EndptDevByID[endptID] = endptDev
-        EndptDevByName[endptName] = endptDev
+        add_topo_dev_lookup(endpt_id, endpt_name, endpt_dev)
+        endpt_dev_by_id[endpt_id] = endpt_dev
+        endpt_dev_by_name[endpt_name] = endpt_dev
         
         # for paramObj interface
-        paramObjByID[endptID] = endptDev
-        paramObjByName[endptName] = endptDev
+        param_obj_by_id[endpt_id] = endpt_dev
+        param_obj_by_name[endpt_name] = endpt_dev
         
         # store id -> name for trace
-        tm.AddName(endptID, endptName, "endpt")
+        tm.add_name(endpt_id, endpt_name, "endpt")
 
     # fetch the network descriptions
-    for netDesc in topoCfg.Networks:
+    for net_desc in topo_cfg.networks:
         # create a runtime representation from its desc representation
-        netobj = net.networkStruct.create_network_struct(netDesc)
+        netobj = net.networkStruct.create_network_struct(net_desc)
         
         # save pointer to net accessible by id or name
-        NetworkByID[netobj.Number] = netobj
-        NetworkByName[netobj.Name] = netobj
-        
+        network_by_id[netobj.number] = netobj
+        network_by_name[netobj.name] = netobj
+
         # for paramObj interface
-        paramObjByID[netobj.Number] = netobj
-        paramObjByName[netobj.Name] = netobj
+        param_obj_by_id[netobj.number] = netobj
+        param_obj_by_name[netobj.name] = netobj
         
         # store id -> name for trace
-        tm.AddName(netobj.Number, netobj.Name, "network")
+        tm.add_name(netobj.number, netobj.name, "network")
 
     # include lists of interfaces for each device
-    for rtrDesc in topoCfg.Routers:
-        for intrfc in rtrDesc.Interfaces:
+    for rtr_desc in topo_cfg.routers:
+        for intrfc in rtr_desc.interfaces:
 
             # create a runtime representation from its desc representation
             is_ = net.create_intrfc_struct(intrfc)
             
             # save is for reference by id or name
-            IntrfcByID[is_.Number] = is_
-            IntrfcByName[intrfc.Name] = is_
-            
+            intrfc_by_id[is_.number] = is_
+            intrfc_by_name[intrfc.name] = is_
+
             # for paramObj interface
-            paramObjByID[is_.Number] = is_
-            paramObjByName[intrfc.Name] = is_
+            param_obj_by_id[is_.number] = is_
+            param_obj_by_name[intrfc.name] = is_
             
             # store id -> name for trace
-            tm.AddName(is_.Number, intrfc.Name, "interface")
-            
-            rtr = RouterDevByName[rtrDesc.Name]
-            rtr.addIntrfc(is_)
+            tm.add_name(is_.number, intrfc.name, "interface")
+
+            rtr = router_dev_by_name[rtr_desc.name]
+            rtr.add_intrfc(is_)
 
     # endpoint interfaces
-    for endptDesc in topoCfg.Endpts:
-        for intrfc in endptDesc.Interfaces:
+    for endpt_desc in topo_cfg.endpts:
+        for intrfc in endpt_desc.interfaces:
             # create a runtime representation from its desc representation
             is_ = net.create_intrfc_struct(intrfc)
             
             # save is for reference by id or name
-            IntrfcByID[is_.Number] = is_
-            IntrfcByName[intrfc.Name] = is_
-            
+            intrfc_by_id[is_.number] = is_
+            intrfc_by_name[intrfc.name] = is_
+
             # store id -> name for trace
-            tm.AddName(is_.Number, intrfc.Name, "interface")
-            
+            tm.add_name(is_.number, intrfc.name, "interface")
+
             # for paramObj interface
-            paramObjByID[is_.Number] = is_
-            paramObjByName[intrfc.Name] = is_
-            
+            param_obj_by_id[is_.number] = is_
+            param_obj_by_name[intrfc.name] = is_
+
             # look up endpoint, use not from endpoint's desc representation
-            endpt = EndptDevByName[endptDesc.Name]
-            endpt.addIntrfc(is_)
+            endpt = endpt_dev_by_name[endpt_desc.name]
+            endpt.add_intrfc(is_)
 
     # switch interfaces
-    for switchDesc in topoCfg.Switches:
-        for intrfc in switchDesc.Interfaces:
+    for switch_desc in topo_cfg.switches:
+        for intrfc in switch_desc.interfaces:
             # create a runtime representation from its desc representation
             is_ = net.create_intrfc_struct(intrfc)
             
             # save is for reference by id or name
-            IntrfcByID[is_.Number] = is_
-            IntrfcByName[intrfc.Name] = is_
-            
+            intrfc_by_id[is_.number] = is_
+            intrfc_by_name[intrfc.name] = is_
+
             # store id -> name for trace
-            tm.AddName(is_.Number, intrfc.Name, "interface")
-            
+            tm.add_name(is_.number, intrfc.name, "interface")
+
             # for paramObj interface
-            paramObjByID[is_.Number] = is_
-            paramObjByName[intrfc.Name] = is_
-            
+            param_obj_by_id[is_.number] = is_
+            param_obj_by_name[intrfc.name] = is_
+
             # look up switch, using switch name from desc representation
-            swtch = SwitchDevByName[switchDesc.Name]
-            swtch.addIntrfc(is_)
+            swtch = switch_dev_by_name[switch_desc.name]
+            swtch.add_intrfc(is_)
 
     # fetch the flow descriptions
-    for flowDesc in topoCfg.Flows:
+    for flow_desc in topo_cfg.flows:
         # create a runtime representation from its desc representation
-        bgf = createBgfStruct(flowDesc)
+        bgf = create_bgf_struct(flow_desc)
         
         # nil returned if parameters don't support a flow (like zero rate)
         if bgf is None:
             continue
         
         # save pointer to net accessible by id or name
-        FlowByID[bgf.FlowID] = bgf
-        FlowByName[bgf.Name] = bgf
-        
+        flow_by_id[bgf.flow_id] = bgf
+        flow_by_name[bgf.name] = bgf
+
         # for paramObj interface
-        paramObjByID[bgf.Number] = bgf
-        paramObjByName[bgf.Name] = bgf
+        param_obj_by_id[bgf.number] = bgf
+        param_obj_by_name[bgf.name] = bgf
         
         # store id -> name for trace
-        tm.AddName(bgf.Number, bgf.Name, "flow")
+        tm.add_name(bgf.number, bgf.name, "flow")
 
     # link the connect fields, now that all interfaces are known
     # loop over routers
-    for rtrDesc in topoCfg.Routers:
+    for rtr_desc in topo_cfg.routers:
         # loop over interfaces the router endpoints
-        for intrfc in rtrDesc.Interfaces:
+        for intrfc in rtr_desc.interfaces:
             # link the run-time representation of this interface to the
             # run-time representation of the interface it connects, if any
             # set the run-time pointer to the network faced by the interface
-            net.linkIntrfcStruct(intrfc)
+            net.link_intrfc_struct(intrfc)
     
     # loop over endpoints
-    for endptDesc in topoCfg.Endpts:
+    for endpt_desc in topo_cfg.endpts:
         # loop over interfaces the endpoint endpoints
-        for intrfc in endptDesc.Interfaces:
+        for intrfc in endpt_desc.interfaces:
             # link the run-time representation of this interface to the
             # run-time representation of the interface it connects, if any
             # set the run-time pointer to the network faced by the interface
-            net.linkIntrfcStruct(intrfc)
-    
+            net.link_intrfc_struct(intrfc)
+
     # loop over switches
-    for switchDesc in topoCfg.Switches:
+    for switch_desc in topo_cfg.switches:
         # loop over interfaces the switch endpoints
-        for intrfc in switchDesc.Interfaces:
+        for intrfc in switch_desc.interfaces:
             # link the run-time representation of this interface to the
             # run-time representation of the interface it connects, if any
             # set the run-time pointer to the network faced by the interface
-            net.linkIntrfcStruct(intrfc)
+            net.link_intrfc_struct(intrfc)
 
     # networks have slices with pointers with things that
     # we know now are initialized, so can finish the initialization
     
     # loop over networks
-    for netd in topoCfg.Networks:
+    for netd in topo_cfg.networks:
         # find the run-time representation of the network
-        netobj = NetworkByName[netd.Name]
-        
-        # initialize it from the desc description of the network
-        netobj.initNetworkStruct(netd)
+        netobj = network_by_name[netd.name]
 
-    for dev in TopoDevByID.values():
-        devID = dev.DevID()
+        # initialize it from the desc description of the network
+        netobj.init_network_struct(netd)
+
+    for dev in topo_dev_by_id.values():
+        dev_id = dev.dev_id()
         
-        # indices of directedTopoGraph are ids derived from position in directedNodes slide
-        # index of the directed node is its identity.  The 'i' component of the intPair is its devID, j is 0 if the source, 1 if dest
-        # index is devID, i component of intPair is directed id of source, j is directed id of destination
+        # indices of directed_topo_graph are ids derived from position in 
+        # directed_nodes slide index of the directed node is its identity.
+        # The 'i' component of the intPair is its devID, j is 0 if the source,
+        # 1 if dest index is devID, i component of intPair is directed id of
+        # source, j is directed id of destination
         
         # create directed nodes
-        srcNode = net.intPair(i=devID, j=0)
-        dstNode = net.intPair(i=devID, j=1)
+        src_node = net.intPair(i=dev_id, j=0)
+        dst_node = net.intPair(i=dev_id, j=1)
 
-        # obtain ids and remember them as mapped to by devID
-        srcNodeID = len(directedNodes)
-        directedNodes.append(srcNode)
-        directedTopoGraph[srcNodeID] = []
+        # obtain ids and remember them as mapped to by dev_id
+        src_node_id = len(directed_nodes)
+        directed_nodes.append(src_node)
+        directed_topo_graph[src_node_id] = []
         
-        dstNodeID = len(directedNodes)
-        directedNodes.append(dstNode)
-        directedTopoGraph[dstNodeID] = []
-        devIDToDirected[devID] = net.intPair(i=srcNodeID, j=dstNodeID)
+        dst_node_id = len(directed_nodes)
+        directed_nodes.append(dst_node)
+        directed_topo_graph[dst_node_id] = []
+        dev_id_to_directed[dev_id] = net.intPair(i=src_node_id, j=dst_node_id)
         
-        directedIDToDev[srcNodeID] = devID
-        directedIDToDev[dstNodeID] = devID
+        directed_id_to_dev[src_node_id] = dev_id
+        directed_id_to_dev[dst_node_id] = dev_id
         
-        # if the device is not an endpoint create an edge from destination node to source node
-        if dev.DevType() is not net.EndptCode:
-            directedTopoGraph[dstNodeID].append(srcNodeID)
+        # if the device is not an endpoint create an edge from 
+        # destination node to source node
+        if (dev.dev_type() is not net.DevCode.EndptCode):
+            directed_topo_graph[dst_node_id].append(src_node_id)
 
-    # put all the connections recorded in the Cabled and Wireless fields into the topoGraph
-    for dev in TopoDevByID.values():
-        devID = dev.DevID()
-        for intrfc in dev.DevIntrfcs():
+    # put all the connections recorded in the Cabled and Wireless 
+    # fields into the topo_graph
+    for dev in topo_dev_by_id.values():
+        dev_id = dev.dev_id()
+        for intrfc in dev.dev_intrfcs():
             connected = False
             # cabled connection
-            if getattr(intrfc, 'Cable', None) is not None and getattr(intrfc.Cable, 'Device', None) is not None and compatibleIntrfcs(intrfc, intrfc.Cable):
-                peerID = intrfc.Cable.Device.DevID()
-                connectIds(topoGraph, devID, peerID, intrfc.Number, intrfc.Cable.Number)
-                connectDirectedIds(directedTopoGraph, devID, peerID)
+            if (getattr(intrfc, 'cable', None) is not None \
+                        and getattr(intrfc.cable, 'device', None) is not None \
+                        and compatible_intrfcs(intrfc, intrfc.cable)
+                ):
+
+                peer_id = intrfc.cable.device.dev_id()
+                connect_ids(topo_graph, dev_id, peer_id, 
+                            intrfc.number, intrfc.cable.number)
+                connect_directed_ids(directed_topo_graph, dev_id, peer_id)
                 connected = True
+            
             # carried connection
-            if not connected and hasattr(intrfc, 'Carry') and len(intrfc.Carry) > 0:
-                for cintrfc in intrfc.Carry:
-                    if compatibleIntrfcs(intrfc, cintrfc):
-                        peerID = cintrfc.Device.DevID()
-                        connectIds(topoGraph, devID, peerID, intrfc.Number, cintrfc.Number)
-                        connectDirectedIds(directedTopoGraph, devID, peerID)
+            if (not connected and hasattr(intrfc, 'carry') \
+                            and len(intrfc.carry) > 0
+            ):
+                for cintrfc in intrfc.carry:
+                    if compatible_intrfcs(intrfc, cintrfc):
+                        peer_id = cintrfc.device.dev_id()
+                        connect_ids(topo_graph, dev_id, peer_id, 
+                                    intrfc.number, cintrfc.number)
+                        connect_directed_ids(directed_topo_graph, dev_id, peer_id)
                         connected = True
+            
             # wireless connection
-            if not connected and hasattr(intrfc, 'Wireless') and len(intrfc.Wireless) > 0:
-                for conn in intrfc.Wireless:
-                    peerID = conn.Device.DevID()
-                    connectIds(topoGraph, devID, peerID, intrfc.Number, conn.Number)
-                    connectDirectedIds(directedTopoGraph, devID, peerID)
+            if (not connected and hasattr(intrfc, 'wireless') \
+                and len(intrfc.wireless) > 0
+            ):
+                for conn in intrfc.wireless:
+                    peer_id = conn.device.dev_id()
+                    connect_ids(topo_graph, dev_id, peer_id, 
+                                intrfc.number, conn.number)
+                    connect_directed_ids(directed_topo_graph, dev_id, peer_id)
 
 
-def createBgfStruct(fd):
+def create_bgf_struct(fd: desc_topo.FlowDesc) -> Optional[flow.Flow]:
     """
-    createBgfStruct creates a Flow object from a FlowDesc
+    create_bgf_struct creates a Flow object from a FlowDesc
     """
-    return flow.CreateFlow(fd.Name, fd.SrcDev, fd.DstDev, fd.ReqRate, fd.FrameSize, fd.Mode, 0, fd.Groups)
+    return flow.create_flow(fd.name, fd.src_dev, fd.dst_dev, 
+                           fd.req_rate, fd.frame_size, fd.mode, 
+                           0, fd.groups)
 
 
-# compatibleIntrfcs checks whether the named pair of interfaces are compatible
+# compatible_intrfcs checks whether the named pair of interfaces are compatible
 # w.r.t. their state on cable, carry, and wireless
-def compatibleIntrfcs(intrfc1: net.intrfcStruct, intrfc2: net.intrfcStruct) -> bool:
-    if getattr(intrfc1, 'Cable', None) is not None and getattr(intrfc2, 'Cable', None) is not None:
+def compatible_intrfcs(intrfc1: net.intrfcStruct, intrfc2: net.intrfcStruct):
+    if getattr(intrfc1, 'cable', None) is not None \
+               and getattr(intrfc2, 'cable', None) is not None:
         return True
-    return hasattr(intrfc1, 'Carry') and len(intrfc1.Carry) > 0 and hasattr(intrfc2, 'Carry') and len(intrfc2.Carry) > 0
+    return hasattr(intrfc1, 'carry') \
+           and len(intrfc1.carry) > 0 \
+           and hasattr(intrfc2, 'carry') \
+           and len(intrfc2.carry) > 0
 
-# addTopoDevLookup puts a new entry in the TopoDevByID and TopoDevByName
-# maps if that entry does not already exist
-def addTopoDevLookup(tdID: int, tdName: str, td: net.TopoDev):
-    global TopoDevByID, TopoDevByName
-    if tdID in TopoDevByID:
-        raise Exception(f"index {tdID} over-used in TopoDevByID\n")
+# add_topo_dev_lookup puts a new entry in the topo_dev_by_id and 
+# topo_dev_by_name maps if that entry does not already exist
+def add_topo_dev_lookup(td_id: int, td_name: str, td: net.TopoDev):
+    global topo_dev_by_id, topo_dev_by_name
+    if td_id in topo_dev_by_id:
+        raise Exception(f"index {td_id} over-used in topo_dev_by_id\n")
     
-    if tdName in TopoDevByName:
-        raise Exception(f"name {tdName} over-used in TopoDevByName\n")
+    if td_name in topo_dev_by_name:
+        raise Exception(f"name {td_name} over-used in topo_dev_by_name\n")
     
-    TopoDevByID[tdID] = td
-    TopoDevByName[tdName] = td
+    topo_dev_by_id[td_id] = td
+    topo_dev_by_name[td_name] = td
 
-
-def InitializeBckgrndEndpt(evtMgr, endptDev):
-    global u01List, numU01
-    if not (endptDev.EndptState.BckgrndRate > 0.0):
+def initialize_bckgrnd_endpt(evt_mgr, endpt_dev):
+    global u01_list, num_u01
+    if not (endpt_dev.endpt_state.bckgrnd_rate > 0.0):
         return
-    
-    ts = endptDev.EndptSched
-    
+
+    ts = endpt_dev.endpt_sched
+
     # only do this once
-    if getattr(ts, 'bckgrndOn', False):
+    if getattr(ts, 'bckgrnd_on', False):
         return
-    
-    rho = endptDev.EndptState.BckgrndRate * endptDev.EndptState.BckgrndSrv
-    
+
+    rho = endpt_dev.endpt_state.bckgrnd_rate * endpt_dev.endpt_state.bckgrnd_srv
+
     # compute the initial number of busy cores
     busy = int(round(ts.cores * rho))
 
     # schedule the background task arrival process
-    u01 = u01List[endptDev.EndptState.BckgrndIdx]
-    endptDev.EndptState.BckgrndIdx = (endptDev.EndptState.BckgrndIdx + 1) % numU01
+    u01 = u01_list[endpt_dev.endpt_state.bckgrnd_idx]
+    endpt_dev.endpt_state.bckgrnd_idx = (endpt_dev.endpt_state.bckgrnd_idx + 1) \
+                                        % num_u01
 
-    arrival = -math.log(1.0-u01) / endptDev.EndptState.BckgrndRate
-    evtMgr.Schedule(endptDev, None, scheduler.addBckgrnd, vrtime.SecondsToTime(arrival))
+    arrival = -math.log(1.0-u01) / endpt_dev.endpt_state.bckgrnd_rate
+    evt_mgr.schedule(endpt_dev, None, scheduler.add_bckgrnd,
+                     vrtime.seconds_to_time(arrival))
     
     # set some cores busy
     for idx in range(busy):
-        ts.inBckgrnd += 1
-        u01 = u01List[endptDev.EndptState.BckgrndIdx]
-        endptDev.EndptState.BckgrndIdx = (endptDev.EndptState.BckgrndIdx + 1) % numU01
-        service = -endptDev.EndptState.BckgrndSrv * math.log(1.0-u01)
-        evtMgr.Schedule(endptDev, None, scheduler.rmBckgrnd, vrtime.SecondsToTime(service))
+        ts.in_bckgrnd += 1
+        u01 = u01_list[endpt_dev.endpt_state.bckgrnd_idx]
+        endpt_dev.endpt_state.bckgrnd_idx = (endpt_dev.endpt_state.bckgrnd_idx + 1) \
+                                            % num_u01
+        service = -endpt_dev.endpt_state.bckgrnd_srv * math.log(1.0-u01)
+        evt_mgr.schedule(endpt_dev, None, scheduler.rm_bckgrnd, 
+                         vrtime.seconds_to_time(service))
 
-    ts.bckgrndOn = True
+    ts.bckgrnd_on = True
 
 
-def InitializeBckgrnd(evtMgr: evtm.EventManager):
-    for endptDev in EndptDevByName.values():
-        InitializeBckgrndEndpt(evtMgr, endptDev)
+def initialize_bckgrnd(evt_mgr: evtm.EventManager):
+    global endpt_dev_by_name
+    for endpt_dev in endpt_dev_by_name.values():
+        initialize_bckgrnd_endpt(evt_mgr, endpt_dev)
 
